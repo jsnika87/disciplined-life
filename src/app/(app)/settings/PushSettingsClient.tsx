@@ -1,8 +1,8 @@
-// src/app/(app)/settings/PushSettingsClient.tsx
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
 import { supabase } from "@/lib/supabaseClient";
+import { ensureUserSettings } from "@/lib/ensureUserSettings";
 
 type Status = "checking" | "enabled" | "disabled" | "unsupported" | "denied" | "error";
 
@@ -13,33 +13,6 @@ function urlBase64ToUint8Array(base64String: string) {
   const outputArray = new Uint8Array(rawData.length);
   for (let i = 0; i < rawData.length; ++i) outputArray[i] = rawData.charCodeAt(i);
   return outputArray;
-}
-
-async function waitForServiceWorkerControl(timeoutMs = 6000) {
-  if (!("serviceWorker" in navigator)) return;
-
-  // If already controlled, done
-  if (navigator.serviceWorker.controller) return;
-
-  // Wait for controllerchange (happens after activation/claim)
-  await new Promise<void>((resolve, reject) => {
-    const t = setTimeout(() => {
-      reject(
-        new Error(
-          "Service worker still isn’t controlling this page yet. Close the PWA, reopen it, then try again."
-        )
-      );
-    }, timeoutMs);
-
-    navigator.serviceWorker.addEventListener(
-      "controllerchange",
-      () => {
-        clearTimeout(t);
-        resolve();
-      },
-      { once: true }
-    );
-  });
 }
 
 export default function PushSettingsClient() {
@@ -73,6 +46,18 @@ export default function PushSettingsClient() {
     else setStatus("disabled");
   }
 
+  // ✅ ensure the user has a settings row (runs once when this component mounts)
+  useEffect(() => {
+    (async () => {
+      try {
+        await ensureUserSettings();
+      } catch (e: any) {
+        // Don't block the rest of the page if this fails, but surface info
+        console.error("ensureUserSettings failed:", e);
+      }
+    })();
+  }, []);
+
   useEffect(() => {
     (async () => {
       try {
@@ -104,7 +89,6 @@ export default function PushSettingsClient() {
       return;
     }
 
-    // iOS check: push requires standalone mode
     const anyNav = navigator as any;
     const standalone =
       window.matchMedia?.("(display-mode: standalone)")?.matches === true ||
@@ -118,24 +102,22 @@ export default function PushSettingsClient() {
       return;
     }
 
+    if (!navigator.serviceWorker.controller) {
+      setStatus("error");
+      setDetail(
+        "Service worker isn’t controlling yet. Close the app and reopen it, then try Enable again."
+      );
+      return;
+    }
+
     setBusy(true);
     setDetail("");
-
     try {
       const permission = await Notification.requestPermission();
       if (permission !== "granted") {
         setStatus(permission === "denied" ? "denied" : "disabled");
         return;
       }
-
-      // Register SW (safe even if already registered)
-      await navigator.serviceWorker.register("/sw.js", { scope: "/" });
-
-      // Wait until SW is ready
-      await navigator.serviceWorker.ready;
-
-      // On iOS PWA, SW can be "ready" but not controlling yet
-      await waitForServiceWorkerControl(7000);
 
       const reg = await navigator.serviceWorker.ready;
       const existing = await reg.pushManager.getSubscription();
@@ -151,10 +133,6 @@ export default function PushSettingsClient() {
       const endpoint = sub.endpoint;
       const p256dh = keys.p256dh;
       const auth = keys.auth;
-
-      if (!endpoint || !p256dh || !auth) {
-        throw new Error("Browser did not return push keys (p256dh/auth).");
-      }
 
       const { data } = await supabase.auth.getSession();
       const token = data.session?.access_token;
@@ -176,11 +154,10 @@ export default function PushSettingsClient() {
 
       if (!res.ok) {
         const j = await res.json().catch(() => ({}));
-        throw new Error(j?.message ?? j?.error ?? "Subscribe failed");
+        throw new Error(j?.error ?? "Subscribe failed");
       }
 
       setStatus("enabled");
-      setDetail("");
     } catch (e: any) {
       setStatus("error");
       setDetail(e?.message ?? "Unknown error");
@@ -207,11 +184,10 @@ export default function PushSettingsClient() {
 
       if (!res.ok) {
         const j = await res.json().catch(() => ({}));
-        throw new Error(j?.message ?? j?.error ?? "Unsubscribe failed");
+        throw new Error(j?.error ?? "Unsubscribe failed");
       }
 
       // optionally also remove browser subscription
-      await navigator.serviceWorker.register("/sw.js", { scope: "/" });
       const reg = await navigator.serviceWorker.ready;
       const existing = await reg.pushManager.getSubscription();
       if (existing) await existing.unsubscribe();
@@ -226,8 +202,7 @@ export default function PushSettingsClient() {
   }
 
   const pill = (() => {
-    const base =
-      "inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium border";
+    const base = "inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium border";
     switch (status) {
       case "enabled":
         return <span className={`${base} border-emerald-500/30 bg-emerald-500/10`}>Enabled</span>;
@@ -236,9 +211,7 @@ export default function PushSettingsClient() {
       case "checking":
         return <span className={`${base} border-zinc-500/30 bg-zinc-500/10`}>Checking…</span>;
       case "unsupported":
-        return (
-          <span className={`${base} border-amber-500/30 bg-amber-500/10`}>Unsupported</span>
-        );
+        return <span className={`${base} border-amber-500/30 bg-amber-500/10`}>Unsupported</span>;
       case "denied":
         return <span className={`${base} border-red-500/30 bg-red-500/10`}>Blocked</span>;
       case "error":
@@ -258,8 +231,7 @@ export default function PushSettingsClient() {
 
       {status === "denied" && (
         <div className="text-sm">
-          Notifications are blocked in your browser settings. Re-enable them for this site, then
-          refresh.
+          Notifications are blocked in your browser settings. Re-enable them for this site, then refresh.
         </div>
       )}
 

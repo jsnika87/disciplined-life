@@ -2,6 +2,7 @@
 import Link from "next/link";
 import PushSettingsClient from "./PushSettingsClient";
 
+
 export default function SettingsPage() {
   return (
     <div className="space-y-4">
