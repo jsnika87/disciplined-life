@@ -1,10 +1,10 @@
 // src/app/(app)/eat/history/page.tsx
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useMemo } from "react";
 import Link from "next/link";
+import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/lib/supabaseClient";
-import HistoryShell from "@/components/history/HistoryShell";
 
 type MealType = "breakfast" | "lunch" | "dinner" | "snack";
 
@@ -33,7 +33,13 @@ function n(v: number | null | undefined) {
 }
 
 function sumMacroItems(
-  items: { quantity: number; calories: number | null; protein_g: number | null; carbs_g: number | null; fat_g: number | null }[]
+  items: {
+    quantity: number;
+    calories: number | null;
+    protein_g: number | null;
+    carbs_g: number | null;
+    fat_g: number | null;
+  }[]
 ) {
   const calories = items.reduce((a, it) => a + n(it.calories) * n(it.quantity), 0);
   const protein = items.reduce((a, it) => a + n(it.protein_g) * n(it.quantity), 0);
@@ -42,67 +48,60 @@ function sumMacroItems(
   return { calories, protein, carbs, fat };
 }
 
-export default function EatHistoryPage() {
-  const [loading, setLoading] = useState(true);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+async function fetchEatHistory() {
+  const { data: userData, error: userErr } = await supabase.auth.getUser();
+  if (userErr) throw userErr;
 
-  const [meals, setMeals] = useState<MealRow[]>([]);
-  const [items, setItems] = useState<MealItemRow[]>([]);
+  const uid = userData.user?.id;
+  if (!uid) throw new Error("Not logged in.");
 
-  async function load() {
-    setLoading(true);
-    setBusy(true);
-    setError(null);
+  const mealsRes = await supabase
+    .schema("disciplined")
+    .from("meals")
+    .select("id,meal_type,meal_date,created_at")
+    .eq("user_id", uid)
+    .order("meal_date", { ascending: false })
+    .order("meal_type", { ascending: true });
 
-    try {
-      const { data: userData } = await supabase.auth.getUser();
-      const uid = userData.user?.id;
-      if (!uid) throw new Error("Not logged in.");
+  if (mealsRes.error) throw mealsRes.error;
 
-      const mealsRes = await supabase
-        .schema("disciplined")
-        .from("meals")
-        .select("id,meal_type,meal_date,created_at")
-        .eq("user_id", uid)
-        .order("meal_date", { ascending: false })
-        .order("meal_type", { ascending: true });
+  const meals = (mealsRes.data ?? []) as MealRow[];
 
-      if (mealsRes.error) throw mealsRes.error;
-
-      const m = (mealsRes.data ?? []) as MealRow[];
-      setMeals(m);
-
-      if (m.length === 0) {
-        setItems([]);
-        return;
-      }
-
-      const mealIds = m.map((x) => x.id);
-
-      const itemsRes = await supabase
-        .schema("disciplined")
-        .from("meal_items")
-        .select("id,meal_id,name,quantity,unit,calories,protein_g,carbs_g,fat_g,created_at")
-        .in("meal_id", mealIds)
-        .order("created_at", { ascending: true });
-
-      if (itemsRes.error) throw itemsRes.error;
-
-      setItems((itemsRes.data ?? []) as MealItemRow[]);
-    } catch (e: any) {
-      setError(e?.message ?? "Failed to load Eat history.");
-      setMeals([]);
-      setItems([]);
-    } finally {
-      setLoading(false);
-      setBusy(false);
-    }
+  if (meals.length === 0) {
+    return { meals: [], items: [] as MealItemRow[] };
   }
 
-  useEffect(() => {
-    load();
-  }, []);
+  const mealIds = meals.map((x) => x.id);
+
+  const itemsRes = await supabase
+    .schema("disciplined")
+    .from("meal_items")
+    .select("id,meal_id,name,quantity,unit,calories,protein_g,carbs_g,fat_g,created_at")
+    .in("meal_id", mealIds)
+    .order("created_at", { ascending: true });
+
+  if (itemsRes.error) throw itemsRes.error;
+
+  const items = (itemsRes.data ?? []) as MealItemRow[];
+
+  return { meals, items };
+}
+
+export default function EatHistoryPage() {
+  const {
+    data,
+    isLoading,
+    isFetching,
+    error,
+    refetch,
+  } = useQuery({
+    queryKey: ["eat-history"],
+    queryFn: fetchEatHistory,
+    staleTime: 60_000, // cached as "fresh" for 60s
+  });
+
+  const meals = data?.meals ?? [];
+  const items = data?.items ?? [];
 
   const itemsByMeal = useMemo(() => {
     const map = new Map<string, MealItemRow[]>();
@@ -127,9 +126,12 @@ export default function EatHistoryPage() {
   const dates = useMemo(() => Array.from(mealsByDate.keys()), [mealsByDate]);
 
   return (
-    <HistoryShell title="Eat history">
+    <div className="max-w-4xl mx-auto px-4 py-8 space-y-6">
       <div className="flex items-start justify-between gap-4">
-        <div className="text-sm opacity-70">Meals you’ve logged (most recent first).</div>
+        <div>
+          <h1 className="text-3xl font-semibold">Eat history</h1>
+          <div className="text-sm opacity-70 mt-1">Meals you’ve logged (most recent first).</div>
+        </div>
 
         <div className="flex gap-2">
           <Link
@@ -141,17 +143,21 @@ export default function EatHistoryPage() {
 
           <button
             className="border rounded-xl px-4 py-3 text-sm font-medium hover:bg-zinc-50 dark:hover:bg-zinc-900"
-            onClick={load}
-            disabled={busy}
+            onClick={() => refetch()}
+            disabled={isLoading || isFetching}
           >
-            {busy ? "Refreshing…" : "Refresh"}
+            {isFetching ? "Refreshing…" : "Refresh"}
           </button>
         </div>
       </div>
 
-      {error && <div className="text-sm text-red-600">{error}</div>}
+      {error ? (
+        <div className="text-sm text-red-600">
+          {(error as any)?.message ?? "Failed to load Eat history."}
+        </div>
+      ) : null}
 
-      {loading ? (
+      {isLoading ? (
         <div className="text-sm opacity-70">Loading…</div>
       ) : dates.length === 0 ? (
         <div className="border rounded-2xl p-6 text-sm opacity-70">No meals logged yet.</div>
@@ -159,6 +165,7 @@ export default function EatHistoryPage() {
         <div className="space-y-6">
           {dates.map((d) => {
             const dayMeals = mealsByDate.get(d) ?? [];
+
             const dayItems = dayMeals.flatMap((m) => itemsByMeal.get(m.id) ?? []);
             const totals = sumMacroItems(dayItems);
 
@@ -220,6 +227,10 @@ export default function EatHistoryPage() {
           })}
         </div>
       )}
-    </HistoryShell>
+
+      {isFetching && !isLoading ? (
+        <div className="text-xs opacity-60">Updating in background…</div>
+      ) : null}
+    </div>
   );
 }

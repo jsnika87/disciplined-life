@@ -1,7 +1,9 @@
+// src/app/(app)/train/page.tsx
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 import Link from "next/link";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/lib/supabaseClient";
 
 type PillarKey = "train" | "eat" | "word" | "freedom";
@@ -33,99 +35,93 @@ async function getUserId(): Promise<string> {
   return uid;
 }
 
-export default function TrainPage() {
-  const todayUtc = useMemo(() => todayISODateUTC(), []);
-  const [loading, setLoading] = useState(true);
-  const [busy, setBusy] = useState(false);
+async function ensureTodayEntry(uid: string, todayUtc: string): Promise<DailyEntry> {
+  // ✅ Atomic get-or-create via upsert
+  const upserted = await supabase
+    .schema("disciplined")
+    .from("daily_entries")
+    .upsert({ user_id: uid, entry_date: todayUtc }, { onConflict: "user_id,entry_date" })
+    .select("id,user_id,entry_date")
+    .single<DailyEntry>();
 
-  const [entry, setEntry] = useState<DailyEntry | null>(null);
-  const [pillar, setPillar] = useState<DailyPillar | null>(null);
+  if (upserted.error) throw upserted.error;
+  return upserted.data;
+}
+
+async function seedTrainPillar(entryId: string) {
+  const seed = await supabase
+    .schema("disciplined")
+    .from("daily_pillars")
+    .upsert(
+      [
+        {
+          entry_id: entryId,
+          pillar: "train",
+          completed: false,
+          completed_at: null,
+          source: null,
+          notes: null,
+        },
+      ],
+      { onConflict: "entry_id,pillar", ignoreDuplicates: true }
+    );
+
+  if (seed.error) throw seed.error;
+}
+
+async function fetchTrainToday(todayUtc: string): Promise<{ entry: DailyEntry; pillar: DailyPillar | null }> {
+  const uid = await getUserId();
+  const entry = await ensureTodayEntry(uid, todayUtc);
+
+  await seedTrainPillar(entry.id);
+
+  const { data, error } = await supabase
+    .schema("disciplined")
+    .from("daily_pillars")
+    .select("entry_id,pillar,completed,completed_at,source,notes")
+    .eq("entry_id", entry.id)
+    .eq("pillar", "train")
+    .maybeSingle<DailyPillar>();
+
+  if (error) throw error;
+
+  return { entry, pillar: data ?? null };
+}
+
+export default function TrainPage() {
+  const queryClient = useQueryClient();
+  const todayUtc = useMemo(() => todayISODateUTC(), []);
 
   const [notes, setNotes] = useState("");
   const [msg, setMsg] = useState<string | null>(null);
-
   const [mode, setMode] = useState<"edit" | "view">("edit");
 
-  // prevents concurrent ensure/load races
-  const ensureInFlightRef = useRef(false);
+  const trainQuery = useQuery({
+    queryKey: ["train-today", todayUtc],
+    queryFn: () => fetchTrainToday(todayUtc),
+    staleTime: 30_000,
+  });
 
+  const entry = trainQuery.data?.entry ?? null;
+  const pillar = trainQuery.data?.pillar ?? null;
   const completed = !!pillar?.completed;
 
-  async function ensureTodayEntry(uid: string): Promise<DailyEntry> {
-    // ✅ Atomic get-or-create via upsert (prevents 409 duplicate key races)
-    const upserted = await supabase
-      .schema("disciplined")
-      .from("daily_entries")
-      .upsert({ user_id: uid, entry_date: todayUtc }, { onConflict: "user_id,entry_date" })
-      .select("id,user_id,entry_date")
-      .single<DailyEntry>();
-
-    if (upserted.error) throw upserted.error;
-    return upserted.data;
-  }
-
-  async function load() {
-    if (ensureInFlightRef.current) return;
-    ensureInFlightRef.current = true;
-
-    setLoading(true);
-    setMsg(null);
-
-    try {
-      const uid = await getUserId();
-      const e = await ensureTodayEntry(uid);
-      setEntry(e);
-
-      // Seed the train pillar row without overwriting
-      const seed = await supabase
-        .schema("disciplined")
-        .from("daily_pillars")
-        .upsert(
-          [
-            {
-              entry_id: e.id,
-              pillar: "train",
-              completed: false,
-              completed_at: null,
-              source: null,
-              notes: null,
-            },
-          ],
-          { onConflict: "entry_id,pillar", ignoreDuplicates: true }
-        );
-
-      if (seed.error) throw seed.error;
-
-      const { data, error } = await supabase
-        .schema("disciplined")
-        .from("daily_pillars")
-        .select("entry_id,pillar,completed,completed_at,source,notes")
-        .eq("entry_id", e.id)
-        .eq("pillar", "train")
-        .maybeSingle<DailyPillar>();
-
-      if (error) throw error;
-
-      setPillar(data ?? null);
-      setNotes((data?.notes as string | null) ?? "");
-
-      // default mode: if completed, show view mode; else edit
-      setMode(data?.completed ? "view" : "edit");
-    } catch (e: any) {
-      setMsg(e?.message ?? "Failed to load Train.");
-    } finally {
-      setLoading(false);
-      ensureInFlightRef.current = false;
+  // Keep local notes + mode aligned when data arrives/changes
+  // (We intentionally do this inline rather than useEffect to avoid flicker on fast cache hits.)
+  if (!trainQuery.isLoading && pillar) {
+    const incomingNotes = (pillar.notes as string | null) ?? "";
+    if (notes === "" && incomingNotes !== "") setNotes(incomingNotes);
+    if (notes !== "" && incomingNotes === "" && completed && mode === "view") {
+      // do nothing
     }
   }
 
-  async function save(completedNext: boolean) {
-    if (!entry) return;
+  const saveMutation = useMutation({
+    mutationFn: async (completedNext: boolean) => {
+      if (!entry) throw new Error("Missing daily entry.");
 
-    setBusy(true);
-    setMsg(null);
+      setMsg(null);
 
-    try {
       const { error } = await supabase
         .schema("disciplined")
         .from("daily_pillars")
@@ -140,22 +136,44 @@ export default function TrainPage() {
 
       if (error) throw error;
 
+      // notify Today screen / listeners
       window.dispatchEvent(new Event("dl:pillar-updated"));
-      await load();
+
+      return completedNext;
+    },
+    onSuccess: async (completedNext) => {
+      await queryClient.invalidateQueries({ queryKey: ["train-today", todayUtc] });
+      // keep other areas warm too (if you later query today summary / streaks)
+      await queryClient.invalidateQueries({ queryKey: ["today"] });
 
       setMsg("Saved.");
       setMode(completedNext ? "view" : "edit");
-    } catch (e: any) {
-      setMsg(e?.message ?? "Failed to save.");
-    } finally {
-      setBusy(false);
+    },
+    onError: (e: any) => setMsg(e?.message ?? "Failed to save."),
+  });
+
+  const loading = trainQuery.isLoading;
+  const busy = saveMutation.isPending || trainQuery.isFetching;
+
+  // After data loads, default mode: completed => view, else edit
+  if (!loading && trainQuery.data) {
+    const desired = completed ? "view" : "edit";
+    if (mode !== desired && msg == null && !saveMutation.isPending) {
+      // only auto-set when user isn't actively interacting
+      setMode(desired);
+    }
+    // Always sync notes from server the first time we load
+    const incomingNotes = (pillar?.notes as string | null) ?? "";
+    if (!saveMutation.isPending && notes === "" && incomingNotes !== "") {
+      setNotes(incomingNotes);
+    }
+    if (!saveMutation.isPending && notes !== "" && incomingNotes !== "" && notes !== incomingNotes && mode === "view") {
+      setNotes(incomingNotes);
+    }
+    if (!saveMutation.isPending && incomingNotes === "" && mode === "view" && notes !== "") {
+      // keep local notes as-is
     }
   }
-
-  useEffect(() => {
-    load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   return (
     <div className="max-w-3xl mx-auto px-4 py-8 space-y-6">
@@ -175,10 +193,10 @@ export default function TrainPage() {
 
           <button
             className="border rounded-xl px-4 py-3 text-sm font-medium hover:bg-zinc-50 dark:hover:bg-zinc-900"
-            onClick={load}
+            onClick={() => trainQuery.refetch()}
             disabled={loading || busy}
           >
-            Refresh
+            {busy && !loading ? "Refreshing…" : "Refresh"}
           </button>
         </div>
       </div>
@@ -200,7 +218,10 @@ export default function TrainPage() {
             <div className="flex flex-wrap gap-3 pt-2">
               <button
                 className="border rounded-xl px-5 py-3 text-sm font-medium hover:bg-zinc-50 dark:hover:bg-zinc-900"
-                onClick={() => setMode("edit")}
+                onClick={() => {
+                  setNotes((pillar?.notes as string | null) ?? "");
+                  setMode("edit");
+                }}
                 disabled={busy}
               >
                 Edit
@@ -208,7 +229,7 @@ export default function TrainPage() {
 
               <button
                 className="border rounded-xl px-5 py-3 text-sm font-medium hover:bg-zinc-50 dark:hover:bg-zinc-900"
-                onClick={() => save(false)}
+                onClick={() => saveMutation.mutate(false)}
                 disabled={busy}
               >
                 Undo completion
@@ -235,16 +256,19 @@ export default function TrainPage() {
             <div className="flex flex-wrap gap-3 pt-2">
               <button
                 className="border rounded-xl px-5 py-3 text-sm font-medium hover:bg-zinc-50 dark:hover:bg-zinc-900"
-                onClick={() => save(true)}
+                onClick={() => saveMutation.mutate(true)}
                 disabled={loading || busy}
               >
-                Save + mark complete
+                {saveMutation.isPending ? "Saving…" : "Save + mark complete"}
               </button>
 
               {completed ? (
                 <button
                   className="border rounded-xl px-5 py-3 text-sm font-medium hover:bg-zinc-50 dark:hover:bg-zinc-900"
-                  onClick={() => setMode("view")}
+                  onClick={() => {
+                    setNotes((pillar?.notes as string | null) ?? "");
+                    setMode("view");
+                  }}
                   disabled={busy}
                 >
                   Cancel

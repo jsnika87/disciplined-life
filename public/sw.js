@@ -1,3 +1,12 @@
+// public/sw.js
+self.addEventListener("install", () => {
+  self.skipWaiting();
+});
+
+self.addEventListener("activate", (event) => {
+  event.waitUntil(self.clients.claim());
+});
+
 self.addEventListener("push", (event) => {
   let data = {};
   try {
@@ -23,7 +32,6 @@ self.addEventListener("notificationclick", (event) => {
   event.waitUntil(clients.openWindow(url));
 });
 
-// Optional: handle subscription refresh
-self.addEventListener("pushsubscriptionchange", (event) => {
-  // We’ll handle re-subscribe from the client on next app open.
+self.addEventListener("pushsubscriptionchange", () => {
+  // We'll re-subscribe from the client on next app open.
 });

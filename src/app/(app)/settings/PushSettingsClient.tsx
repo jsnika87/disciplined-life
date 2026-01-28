@@ -70,9 +70,30 @@ export default function PushSettingsClient() {
 
   async function enablePush() {
     if (!supported) return;
+
     if (!vapidPublicKey) {
       setStatus("error");
       setDetail("Missing NEXT_PUBLIC_VAPID_PUBLIC_KEY");
+      return;
+    }
+    const anyNav = navigator as any;
+    const standalone =
+      window.matchMedia?.("(display-mode: standalone)")?.matches === true ||
+      anyNav?.standalone === true;
+
+    if (!standalone) {
+      setStatus("error");
+      setDetail(
+        "On iPhone, push works only after installing to Home Screen. Install it, then reopen the app and try again."
+      );
+      return;
+    }
+
+    if (!navigator.serviceWorker.controller) {
+      setStatus("error");
+      setDetail(
+        "Service worker isn’t controlling yet. Close the app and reopen it, then try Enable again."
+      );
       return;
     }
 

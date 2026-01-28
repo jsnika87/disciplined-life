@@ -25,6 +25,19 @@ type FlatBody = {
   userAgent?: string;
 };
 
+function jsonNoStore(body: any, init?: ResponseInit) {
+  const res = NextResponse.json(body, init);
+  res.headers.set("Cache-Control", "no-store");
+  return res;
+}
+
+async function withTimeout<T>(ms: number, fn: () => Promise<T>): Promise<T> {
+  return await Promise.race([
+    fn(),
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error("timeout")), ms)),
+  ]);
+}
+
 export async function POST(request: Request) {
   try {
     const supabaseUrl = getEnv("NEXT_PUBLIC_SUPABASE_URL");
@@ -35,22 +48,22 @@ export async function POST(request: Request) {
       authHeader && authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
 
     if (!accessToken) {
-      return NextResponse.json({ ok: false, reason: "missing_token" }, { status: 401 });
+      return jsonNoStore({ ok: false, reason: "missing_token" }, { status: 401 });
     }
 
-    let body: any = null;
+    let body: unknown = null;
     try {
       body = await request.json();
     } catch {
       body = null;
     }
 
-    // Accept BOTH payload shapes:
-    // 1) { subscription: { endpoint, keys: {p256dh, auth} }, userAgent }
-    // 2) { endpoint, p256dh, auth, userAgent }
     const nested = body as NestedBody;
     const flat = body as FlatBody;
 
+    // Accept BOTH payload shapes:
+    // 1) { subscription: { endpoint, keys: {p256dh, auth} }, userAgent }
+    // 2) { endpoint, p256dh, auth, userAgent }
     const endpoint =
       nested?.subscription?.endpoint ??
       (typeof flat?.endpoint === "string" ? flat.endpoint : undefined);
@@ -71,50 +84,77 @@ export async function POST(request: Request) {
           : null;
 
     if (!endpoint || !p256dh || !auth) {
-      return NextResponse.json(
-        { ok: false, reason: "missing_subscription", received: body },
+      // Don’t echo full payload back (can be large + not necessary)
+      return jsonNoStore(
+        {
+          ok: false,
+          reason: "missing_subscription",
+          received: {
+            hasEndpoint: !!endpoint,
+            hasP256dh: !!p256dh,
+            hasAuth: !!auth,
+          },
+        },
         { status: 400 }
       );
     }
 
     const admin = createClient(supabaseUrl, serviceKey, {
-      auth: { persistSession: false },
+      auth: {
+        persistSession: false,
+        autoRefreshToken: false,
+        detectSessionInUrl: false,
+      },
     });
 
-    const { data: userData, error: userErr } = await admin.auth.getUser(accessToken);
-    if (userErr || !userData?.user) {
-      return NextResponse.json({ ok: false, reason: "invalid_token" }, { status: 401 });
+    // Keep this endpoint snappy. If Supabase is slow, don’t hang the PWA.
+    const userId = await withTimeout(5000, async () => {
+      const { data: userData, error: userErr } = await admin.auth.getUser(accessToken);
+      if (userErr || !userData?.user) throw new Error("invalid_token");
+      return userData.user.id;
+    }).catch((e: any) => {
+      if (e?.message === "invalid_token") return null;
+      throw e;
+    });
+
+    if (!userId) {
+      return jsonNoStore({ ok: false, reason: "invalid_token" }, { status: 401 });
     }
 
-    const userId = userData.user.id;
+    const now = new Date().toISOString();
 
-    const { error } = await admin
-      .schema("disciplined")
-      .from("push_subscriptions")
-      .upsert(
-        {
-          user_id: userId,
-          endpoint,
-          p256dh,
-          auth,
-          user_agent: userAgent,
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: "endpoint" }
-      );
+    const upsertResult = await withTimeout(5000, async () => {
+      return await admin
+        .schema("disciplined")
+        .from("push_subscriptions")
+        .upsert(
+          {
+            user_id: userId,
+            endpoint,
+            p256dh,
+            auth,
+            user_agent: userAgent,
+            updated_at: now,
+          },
+          { onConflict: "endpoint" }
+        );
+    });
 
-    if (error) {
-      return NextResponse.json(
-        { ok: false, reason: "db_error", message: error.message },
+    if (upsertResult.error) {
+      return jsonNoStore(
+        { ok: false, reason: "db_error", message: upsertResult.error.message },
         { status: 500 }
       );
     }
 
-    return NextResponse.json({ ok: true }, { status: 200 });
+    return jsonNoStore({ ok: true }, { status: 200 });
   } catch (e: any) {
-    return NextResponse.json(
-      { ok: false, reason: "server_error", message: e?.message ?? "unknown" },
-      { status: 500 }
+    const msg = e?.message ?? "unknown";
+    const status = msg === "timeout" ? 504 : 500;
+
+    return jsonNoStore(
+      { ok: false, reason: msg === "timeout" ? "timeout" : "server_error", message: msg },
+      { status }
     );
   }
 }

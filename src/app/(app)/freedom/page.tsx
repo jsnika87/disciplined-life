@@ -1,7 +1,9 @@
+// src/app/(app)/freedom/page.tsx
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 import Link from "next/link";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/lib/supabaseClient";
 
 type FreedomEntry = {
@@ -27,133 +29,98 @@ async function getUserId(): Promise<string> {
   return uid;
 }
 
+async function ensureDailyEntry(uid: string, todayUtc: string): Promise<string> {
+  // ✅ Atomic create-or-get
+  const upserted = await supabase
+    .schema("disciplined")
+    .from("daily_entries")
+    .upsert({ user_id: uid, entry_date: todayUtc }, { onConflict: "user_id,entry_date" })
+    .select("id")
+    .single<{ id: string }>();
+
+  if (upserted.error) throw upserted.error;
+  return upserted.data.id;
+}
+
+async function markFreedomComplete(uid: string, todayUtc: string, completed: boolean) {
+  const entryId = await ensureDailyEntry(uid, todayUtc);
+
+  // seed row without overwrite
+  const seed = await supabase
+    .schema("disciplined")
+    .from("daily_pillars")
+    .upsert(
+      [
+        {
+          entry_id: entryId,
+          pillar: "freedom",
+          completed: false,
+          completed_at: null,
+          source: null,
+        },
+      ],
+      { onConflict: "entry_id,pillar", ignoreDuplicates: true }
+    );
+
+  if (seed.error) throw seed.error;
+
+  const upd = await supabase
+    .schema("disciplined")
+    .from("daily_pillars")
+    .update({
+      completed,
+      completed_at: completed ? new Date().toISOString() : null,
+      source: "auto",
+    })
+    .eq("entry_id", entryId)
+    .eq("pillar", "freedom");
+
+  if (upd.error) throw upd.error;
+
+  window.dispatchEvent(new Event("dl:pillar-updated"));
+}
+
+async function fetchFreedomToday(todayUtc: string): Promise<FreedomEntry | null> {
+  const uid = await getUserId();
+
+  const { data, error } = await supabase
+    .schema("disciplined")
+    .from("freedom_entries")
+    .select("id,user_id,entry_date,action_type,custom_action,notes,created_at,updated_at")
+    .eq("user_id", uid)
+    .eq("entry_date", todayUtc)
+    .maybeSingle<FreedomEntry>();
+
+  if (error) throw error;
+  return data ?? null;
+}
+
 export default function FreedomPage() {
+  const queryClient = useQueryClient();
   const todayUtc = useMemo(() => todayISODateUTC(), []);
-  const [loading, setLoading] = useState(true);
-  const [busy, setBusy] = useState(false);
 
-  const [saved, setSaved] = useState<FreedomEntry | null>(null);
   const [mode, setMode] = useState<"edit" | "view">("edit");
-
   const [actionType, setActionType] = useState<string>("avoid_trigger");
   const [customAction, setCustomAction] = useState<string>("");
   const [notes, setNotes] = useState<string>("");
-
   const [msg, setMsg] = useState<string | null>(null);
 
-  // prevent concurrent ensure/mark storms
-  const ensureEntryInFlightRef = useRef(false);
+  const freedomQuery = useQuery({
+    queryKey: ["freedom-today", todayUtc],
+    queryFn: () => fetchFreedomToday(todayUtc),
+    staleTime: 30_000,
+  });
+
+  const saved = freedomQuery.data ?? null;
 
   const actionLabel = useMemo(() => {
     if (!saved) return "";
     return saved.action_type === "custom" ? saved.custom_action || "Custom" : saved.action_type;
   }, [saved]);
 
-  async function ensureDailyEntry(uid: string) {
-    if (ensureEntryInFlightRef.current) {
-      await new Promise((r) => setTimeout(r, 50));
-    }
-    ensureEntryInFlightRef.current = true;
-
-    try {
-      // ✅ Atomic create-or-get
-      const upserted = await supabase
-        .schema("disciplined")
-        .from("daily_entries")
-        .upsert(
-          { user_id: uid, entry_date: todayUtc },
-          { onConflict: "user_id,entry_date" }
-        )
-        .select("id")
-        .single<{ id: string }>();
-
-      if (upserted.error) throw upserted.error;
-      return upserted.data.id;
-    } finally {
-      ensureEntryInFlightRef.current = false;
-    }
-  }
-
-  async function markFreedomComplete(uid: string, completed: boolean) {
-    const entryId = await ensureDailyEntry(uid);
-
-    // seed row without overwrite
-    const seed = await supabase
-      .schema("disciplined")
-      .from("daily_pillars")
-      .upsert(
-        [
-          {
-            entry_id: entryId,
-            pillar: "freedom",
-            completed: false,
-            completed_at: null,
-            source: null,
-          },
-        ],
-        { onConflict: "entry_id,pillar", ignoreDuplicates: true }
-      );
-
-    if (seed.error) throw seed.error;
-
-    const upd = await supabase
-      .schema("disciplined")
-      .from("daily_pillars")
-      .update({
-        completed,
-        completed_at: completed ? new Date().toISOString() : null,
-        source: "auto",
-      })
-      .eq("entry_id", entryId)
-      .eq("pillar", "freedom");
-
-    if (upd.error) throw upd.error;
-
-    window.dispatchEvent(new Event("dl:pillar-updated"));
-  }
-
-  async function load() {
-    setLoading(true);
-    setMsg(null);
-
-    try {
-      const uid = await getUserId();
-
-      const { data, error } = await supabase
-        .schema("disciplined")
-        .from("freedom_entries")
-        .select("id,user_id,entry_date,action_type,custom_action,notes,created_at,updated_at")
-        .eq("user_id", uid)
-        .eq("entry_date", todayUtc)
-        .maybeSingle<FreedomEntry>();
-
-      if (error) throw error;
-
-      if (data) {
-        setSaved(data);
-        setMode("view");
-        setActionType(data.action_type);
-        setCustomAction(data.custom_action ?? "");
-        setNotes(data.notes ?? "");
-      } else {
-        setSaved(null);
-        setMode("edit");
-        setActionType("avoid_trigger");
-        setCustomAction("");
-        setNotes("");
-      }
-    } catch (e: any) {
-      setMsg(e?.message ?? "Failed to load Freedom.");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function onSave() {
-    setBusy(true);
-    setMsg(null);
-
-    try {
+  const saveMutation = useMutation({
+    mutationFn: async () => {
+      setMsg(null);
       const uid = await getUserId();
 
       const entry = {
@@ -174,24 +141,22 @@ export default function FreedomPage() {
 
       if (error) throw error;
 
-      setSaved(data);
+      await markFreedomComplete(uid, todayUtc, true);
+      return data;
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["freedom-today", todayUtc] });
+      await queryClient.invalidateQueries({ queryKey: ["today"] });
+
       setMode("view");
-
-      await markFreedomComplete(uid, true);
-
       setMsg("Saved.");
-    } catch (e: any) {
-      setMsg(e?.message ?? "Failed to save.");
-    } finally {
-      setBusy(false);
-    }
-  }
+    },
+    onError: (e: any) => setMsg(e?.message ?? "Failed to save."),
+  });
 
-  async function onClearToday() {
-    setBusy(true);
-    setMsg(null);
-
-    try {
+  const clearMutation = useMutation({
+    mutationFn: async () => {
+      setMsg(null);
       const uid = await getUserId();
 
       const { error } = await supabase
@@ -203,26 +168,24 @@ export default function FreedomPage() {
 
       if (error) throw error;
 
-      setSaved(null);
+      await markFreedomComplete(uid, todayUtc, false);
+      return true;
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["freedom-today", todayUtc] });
+      await queryClient.invalidateQueries({ queryKey: ["today"] });
+
       setMode("edit");
       setActionType("avoid_trigger");
       setCustomAction("");
       setNotes("");
-
-      await markFreedomComplete(uid, false);
-
       setMsg("Cleared for today.");
-    } catch (e: any) {
-      setMsg(e?.message ?? "Failed to clear.");
-    } finally {
-      setBusy(false);
-    }
-  }
+    },
+    onError: (e: any) => setMsg(e?.message ?? "Failed to clear."),
+  });
 
-  useEffect(() => {
-    load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  const loading = freedomQuery.isLoading;
+  const busy = freedomQuery.isFetching || saveMutation.isPending || clearMutation.isPending;
 
   return (
     <div className="max-w-3xl mx-auto px-4 py-8 space-y-6">
@@ -242,16 +205,18 @@ export default function FreedomPage() {
 
           <button
             className="border rounded-xl px-4 py-3 text-sm font-medium hover:bg-zinc-50 dark:hover:bg-zinc-900"
-            onClick={load}
+            onClick={() => freedomQuery.refetch()}
             disabled={loading || busy}
           >
-            Refresh
+            {busy && !loading ? "Refreshing…" : "Refresh"}
           </button>
         </div>
       </div>
 
       <div className="border rounded-2xl p-6 space-y-5">
-        {saved && mode === "view" ? (
+        {loading ? (
+          <div className="text-sm opacity-70">Loading…</div>
+        ) : saved && mode === "view" ? (
           <>
             <div className="text-sm opacity-70">You have a saved Freedom entry for today.</div>
 
@@ -267,7 +232,12 @@ export default function FreedomPage() {
             <div className="flex flex-wrap gap-3 pt-2">
               <button
                 className="border rounded-xl px-5 py-3 text-sm font-medium hover:bg-zinc-50 dark:hover:bg-zinc-900"
-                onClick={() => setMode("edit")}
+                onClick={() => {
+                  setActionType(saved.action_type);
+                  setCustomAction(saved.custom_action ?? "");
+                  setNotes(saved.notes ?? "");
+                  setMode("edit");
+                }}
                 disabled={busy}
               >
                 Edit
@@ -275,10 +245,10 @@ export default function FreedomPage() {
 
               <button
                 className="border rounded-xl px-5 py-3 text-sm font-medium hover:bg-zinc-50 dark:hover:bg-zinc-900"
-                onClick={onClearToday}
+                onClick={() => clearMutation.mutate()}
                 disabled={busy}
               >
-                Clear today
+                {clearMutation.isPending ? "Clearing…" : "Clear today"}
               </button>
             </div>
           </>
@@ -331,16 +301,19 @@ export default function FreedomPage() {
             <div className="flex flex-wrap gap-3 pt-2">
               <button
                 className="border rounded-xl px-5 py-3 text-sm font-medium hover:bg-zinc-50 dark:hover:bg-zinc-900"
-                onClick={onSave}
+                onClick={() => saveMutation.mutate()}
                 disabled={loading || busy}
               >
-                Save
+                {saveMutation.isPending ? "Saving…" : "Save"}
               </button>
 
               {saved ? (
                 <button
                   className="border rounded-xl px-5 py-3 text-sm font-medium hover:bg-zinc-50 dark:hover:bg-zinc-900"
-                  onClick={() => setMode("view")}
+                  onClick={() => {
+                    setMode("view");
+                    setMsg(null);
+                  }}
                   disabled={busy}
                 >
                   Cancel
