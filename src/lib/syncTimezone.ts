@@ -1,41 +1,62 @@
 import { supabase } from "@/lib/supabaseClient";
 
-export async function syncTimezoneIfNeeded() {
+const LS_KEY = "dl:lastTimezoneSyncAt";
+const LS_TZ_KEY = "dl:lastTimezoneSynced";
+
+function getBrowserTimezone(): string | null {
+  try {
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    return typeof tz === "string" && tz.length > 0 ? tz : null;
+  } catch {
+    return null;
+  }
+}
+
+// throttle so we don’t hit DB every navigation
+function shouldSync(tz: string): boolean {
+  const lastTz = localStorage.getItem(LS_TZ_KEY);
+  const lastAt = Number(localStorage.getItem(LS_KEY) || "0");
+  const now = Date.now();
+
+  // If tz changed, sync immediately
+  if (lastTz !== tz) return true;
+
+  // Otherwise sync at most once per 24h
+  const ONE_DAY = 24 * 60 * 60 * 1000;
+  return now - lastAt > ONE_DAY;
+}
+
+export async function syncTimezoneOnce(): Promise<void> {
   if (typeof window === "undefined") return;
 
-  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const tz = getBrowserTimezone();
   if (!tz) return;
 
-  const { data } = await supabase.auth.getUser();
-  const userId = data.user?.id;
-  if (!userId) return;
+  // must be logged in
+  const { data } = await supabase.auth.getSession();
+  const token = data.session?.access_token;
+  if (!token) return;
 
-  const { data: profile, error: selectErr } = await supabase
-    .schema("disciplined")
-    .from("profiles")
-    .select("timezone")
-    .eq("id", userId)
-    .maybeSingle<{ timezone: string | null }>();
+  if (!shouldSync(tz)) return;
 
-  if (selectErr) {
-    console.warn("[timezone] select failed:", selectErr.message);
+  const res = await fetch("/api/profile/timezone", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ timezone: tz }),
+  });
+
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    // don’t throw hard — just log
+    console.warn("[timezone-sync] failed", res.status, txt);
     return;
   }
 
-  if (profile?.timezone === tz) return;
+  localStorage.setItem(LS_KEY, String(Date.now()));
+  localStorage.setItem(LS_TZ_KEY, tz);
 
-  const { error: updateErr } = await supabase
-    .schema("disciplined")
-    .from("profiles")
-    .update({
-      timezone: tz,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", userId);
-
-  if (updateErr) {
-    console.warn("[timezone] update failed:", updateErr.message);
-  } else {
-    console.log("[timezone] set to", tz);
-  }
+  console.log("[timezone-sync] updated:", tz);
 }

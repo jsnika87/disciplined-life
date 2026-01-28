@@ -7,8 +7,8 @@ import TimezoneSync from "@/components/auth/TimezoneSync";
 export default function AppLayout({ children }: { children: ReactNode }) {
   return (
     <AppProviders>
+      <TimezoneSync />
       <RequireApproved>
-        <TimezoneSync />
         <AppShell>{children}</AppShell>
       </RequireApproved>
     </AppProviders>

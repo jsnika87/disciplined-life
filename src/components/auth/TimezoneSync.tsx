@@ -1,11 +1,12 @@
 "use client";
 
 import { useEffect } from "react";
-import { syncTimezoneIfNeeded } from "@/lib/syncTimezone";
+import { syncTimezoneOnce } from "@/lib/syncTimezone";
 
 export default function TimezoneSync() {
   useEffect(() => {
-    syncTimezoneIfNeeded();
+    // fire and forget
+    syncTimezoneOnce();
   }, []);
 
   return null;
