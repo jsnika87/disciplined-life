@@ -33,7 +33,6 @@ export async function POST(request: Request) {
       auth: { persistSession: false },
     });
 
-    // Identify user from JWT
     const { data: userData, error: userErr } = await admin.auth.getUser(accessToken);
     if (userErr || !userData?.user) {
       return NextResponse.json({ ok: false, reason: "invalid_token" }, { status: 401 });
@@ -41,7 +40,6 @@ export async function POST(request: Request) {
 
     const userId = userData.user.id;
 
-    // Update profile timezone (profiles.id is uuid)
     const { error: updErr } = await admin
       .schema("disciplined")
       .from("profiles")
