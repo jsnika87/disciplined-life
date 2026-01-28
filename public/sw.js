@@ -1,5 +1,4 @@
-// public/sw.js
-self.addEventListener("install", () => {
+self.addEventListener("install", (event) => {
   self.skipWaiting();
 });
 
@@ -29,9 +28,9 @@ self.addEventListener("push", (event) => {
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   const url = (event.notification.data && event.notification.data.url) || "/today";
-  event.waitUntil(clients.openWindow(url));
+  event.waitUntil(self.clients.openWindow(url));
 });
 
-self.addEventListener("pushsubscriptionchange", () => {
+self.addEventListener("pushsubscriptionchange", (_event) => {
   // We'll re-subscribe from the client on next app open.
 });

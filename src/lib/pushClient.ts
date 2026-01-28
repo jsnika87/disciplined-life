@@ -42,12 +42,35 @@ function isStandalonePWA() {
 export async function ensureServiceWorker() {
   if (!("serviceWorker" in navigator)) throw new Error("Service workers not supported.");
 
-  // Prefer an existing registration if present (prevents iOS weirdness)
-  const existing = await navigator.serviceWorker.getRegistration("/");
-  if (existing) return existing;
+  const reg =
+    (await navigator.serviceWorker.getRegistration("/")) ??
+    (await navigator.serviceWorker.register("/sw.js", { scope: "/" }));
 
-  // Register your SW (public/sw.js => /sw.js)
-  return await navigator.serviceWorker.register("/sw.js", { scope: "/" });
+  await navigator.serviceWorker.ready;
+
+  if (!navigator.serviceWorker.controller) {
+    const becameControlled = await new Promise<boolean>((resolve) => {
+      const t = setTimeout(() => resolve(false), 1200);
+      navigator.serviceWorker.addEventListener(
+        "controllerchange",
+        () => {
+          clearTimeout(t);
+          resolve(true);
+        },
+        { once: true }
+      );
+    });
+
+    if (!becameControlled) {
+      const key = "__dl_sw_reload_once__";
+      if (!sessionStorage.getItem(key)) {
+        sessionStorage.setItem(key, "1");
+        window.location.reload();
+      }
+    }
+  }
+
+  return reg;
 }
 
 async function ensureControlledPageOrThrow() {
