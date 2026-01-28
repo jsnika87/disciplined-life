@@ -15,6 +15,33 @@ function urlBase64ToUint8Array(base64String: string) {
   return outputArray;
 }
 
+async function waitForServiceWorkerControl(timeoutMs = 6000) {
+  if (!("serviceWorker" in navigator)) return;
+
+  // If already controlled, done
+  if (navigator.serviceWorker.controller) return;
+
+  // Wait for controllerchange (happens after activation/claim)
+  await new Promise<void>((resolve, reject) => {
+    const t = setTimeout(() => {
+      reject(
+        new Error(
+          "Service worker still isn’t controlling this page yet. Close the PWA, reopen it, then try again."
+        )
+      );
+    }, timeoutMs);
+
+    navigator.serviceWorker.addEventListener(
+      "controllerchange",
+      () => {
+        clearTimeout(t);
+        resolve();
+      },
+      { once: true }
+    );
+  });
+}
+
 export default function PushSettingsClient() {
   const vapidPublicKey = process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY;
 
@@ -76,6 +103,8 @@ export default function PushSettingsClient() {
       setDetail("Missing NEXT_PUBLIC_VAPID_PUBLIC_KEY");
       return;
     }
+
+    // iOS check: push requires standalone mode
     const anyNav = navigator as any;
     const standalone =
       window.matchMedia?.("(display-mode: standalone)")?.matches === true ||
@@ -89,22 +118,24 @@ export default function PushSettingsClient() {
       return;
     }
 
-    if (!navigator.serviceWorker.controller) {
-      setStatus("error");
-      setDetail(
-        "Service worker isn’t controlling yet. Close the app and reopen it, then try Enable again."
-      );
-      return;
-    }
-
     setBusy(true);
     setDetail("");
+
     try {
       const permission = await Notification.requestPermission();
       if (permission !== "granted") {
         setStatus(permission === "denied" ? "denied" : "disabled");
         return;
       }
+
+      // Register SW (safe even if already registered)
+      await navigator.serviceWorker.register("/sw.js", { scope: "/" });
+
+      // Wait until SW is ready
+      await navigator.serviceWorker.ready;
+
+      // On iOS PWA, SW can be "ready" but not controlling yet
+      await waitForServiceWorkerControl(7000);
 
       const reg = await navigator.serviceWorker.ready;
       const existing = await reg.pushManager.getSubscription();
@@ -120,6 +151,10 @@ export default function PushSettingsClient() {
       const endpoint = sub.endpoint;
       const p256dh = keys.p256dh;
       const auth = keys.auth;
+
+      if (!endpoint || !p256dh || !auth) {
+        throw new Error("Browser did not return push keys (p256dh/auth).");
+      }
 
       const { data } = await supabase.auth.getSession();
       const token = data.session?.access_token;
@@ -141,10 +176,11 @@ export default function PushSettingsClient() {
 
       if (!res.ok) {
         const j = await res.json().catch(() => ({}));
-        throw new Error(j?.error ?? "Subscribe failed");
+        throw new Error(j?.message ?? j?.error ?? "Subscribe failed");
       }
 
       setStatus("enabled");
+      setDetail("");
     } catch (e: any) {
       setStatus("error");
       setDetail(e?.message ?? "Unknown error");
@@ -171,10 +207,11 @@ export default function PushSettingsClient() {
 
       if (!res.ok) {
         const j = await res.json().catch(() => ({}));
-        throw new Error(j?.error ?? "Unsubscribe failed");
+        throw new Error(j?.message ?? j?.error ?? "Unsubscribe failed");
       }
 
       // optionally also remove browser subscription
+      await navigator.serviceWorker.register("/sw.js", { scope: "/" });
       const reg = await navigator.serviceWorker.ready;
       const existing = await reg.pushManager.getSubscription();
       if (existing) await existing.unsubscribe();
@@ -214,9 +251,7 @@ export default function PushSettingsClient() {
       <div className="flex items-start justify-between gap-3">
         <div>
           <div className="font-semibold">Push notifications</div>
-          <div className="text-sm opacity-70">
-            Enable reminders and alerts on this device.
-          </div>
+          <div className="text-sm opacity-70">Enable reminders and alerts on this device.</div>
         </div>
         {pill}
       </div>
@@ -229,9 +264,7 @@ export default function PushSettingsClient() {
       )}
 
       {status === "unsupported" && (
-        <div className="text-sm">
-          Your browser/device doesn’t support push notifications for PWAs.
-        </div>
+        <div className="text-sm">Your browser/device doesn’t support push notifications for PWAs.</div>
       )}
 
       {status === "error" && detail && (
