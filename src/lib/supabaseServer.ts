@@ -4,27 +4,21 @@ import "server-only";
 import { cookies } from "next/headers";
 import { createServerClient } from "@supabase/ssr";
 
-export function createSupabaseServerClient() {
+export async function createSupabaseServerClient() {
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
   const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
 
-  return createServerClient(supabaseUrl, supabaseAnonKey, {
-    // ✅ Make "disciplined" the default schema so `.from("profiles")`
-    // targets `disciplined.profiles` instead of `public.profiles`
-    db: { schema: "disciplined" },
+  const cookieStore = await cookies();
 
+  return createServerClient(supabaseUrl, supabaseAnonKey, {
     cookies: {
-      async get(name: string) {
-        const cookieStore = await cookies();
-        return cookieStore.get(name)?.value;
+      getAll() {
+        return cookieStore.getAll();
       },
-      async set(name: string, value: string, options: any) {
-        const cookieStore = await cookies();
-        cookieStore.set({ name, value, ...options });
-      },
-      async remove(name: string, options: any) {
-        const cookieStore = await cookies();
-        cookieStore.set({ name, value: "", ...options, maxAge: 0 });
+      setAll(cookiesToSet) {
+        cookiesToSet.forEach(({ name, value, options }) => {
+          cookieStore.set(name, value, options);
+        });
       },
     },
   });

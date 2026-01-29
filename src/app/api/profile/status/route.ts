@@ -6,7 +6,7 @@ export const dynamic = "force-dynamic";
 
 export async function GET() {
   try {
-    const supabase = createSupabaseServerClient();
+    const supabase = await createSupabaseServerClient();
 
     const {
       data: { user },
@@ -17,7 +17,6 @@ export async function GET() {
       return NextResponse.json({ ok: false, reason: "not_authenticated" }, { status: 401 });
     }
 
-    // ✅ IMPORTANT: explicitly query disciplined schema
     const { data: profile, error: profErr } = await supabase
       .schema("disciplined")
       .from("profiles")
