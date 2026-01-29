@@ -1,3 +1,4 @@
+// src/lib/supabaseClient.ts
 import { createClient } from "@supabase/supabase-js";
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -8,6 +9,10 @@ if (!supabaseUrl || !supabaseAnonKey) {
 }
 
 export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+  // ✅ Make "disciplined" the default schema so `.from("profiles")`
+  // automatically targets `disciplined.profiles` (not `public.profiles`)
+  db: { schema: "disciplined" },
+
   auth: {
     persistSession: true,
     autoRefreshToken: true,
