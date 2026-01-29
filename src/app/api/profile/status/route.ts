@@ -14,22 +14,18 @@ export async function GET() {
     } = await supabase.auth.getUser();
 
     if (userErr || !user) {
-      return NextResponse.json(
-        { ok: false, reason: "not_authenticated" },
-        { status: 401 }
-      );
+      return NextResponse.json({ ok: false, reason: "not_authenticated" }, { status: 401 });
     }
 
-    // Because supabaseServer client now defaults to disciplined schema,
-    // this targets disciplined.profiles even without `.schema("disciplined")`
+    // ✅ IMPORTANT: explicitly query disciplined schema
     const { data: profile, error: profErr } = await supabase
+      .schema("disciplined")
       .from("profiles")
       .select("id, role, approved, email")
       .eq("id", user.id)
       .single();
 
     if (profErr || !profile) {
-      // Missing or unreadable profile -> treat as pending (safe)
       return NextResponse.json({
         ok: true,
         userId: user.id,

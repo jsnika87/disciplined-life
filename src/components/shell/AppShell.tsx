@@ -20,6 +20,10 @@ type NavItem = {
   requiresAdmin?: boolean;
 };
 
+type StatusResponse =
+  | { ok: true; userId: string; role: "pending" | "user" | "admin"; approved: boolean; email?: string | null }
+  | { ok: false; reason: string; message?: string };
+
 export default function AppShell({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const pathname = usePathname();
@@ -36,17 +40,13 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     return pathname === "/login" || pathname === "/signup" || pathname === "/pending";
   }, [pathname]);
 
-  const showChrome = useMemo(() => {
-    // Hide header/nav on auth screens
-    return !isAuthRoute;
-  }, [isAuthRoute]);
+  const showChrome = useMemo(() => !isAuthRoute, [isAuthRoute]);
 
   function safeReplace(to: string) {
     if (redirectingRef.current) return;
     if (pathname === to) return;
 
     const now = Date.now();
-    // cooldown to prevent replaceState storms
     if (now - lastRedirectAtRef.current < 800) return;
 
     redirectingRef.current = true;
@@ -59,19 +59,10 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     }, 1000);
   }
 
-  async function fetchProfile(userId: string) {
-    const { data, error } = await supabase
-      .schema("disciplined")
-      .from("profiles")
-      .select("id,email,display_name,role,approved")
-      .eq("id", userId)
-      .single<Profile>();
-
-    if (error) {
-      // If schema/privileges are briefly unhappy, don’t crash UI
-      return null;
-    }
-    return data ?? null;
+  async function fetchStatus(): Promise<StatusResponse> {
+    const res = await fetch("/api/profile/status", { method: "GET", cache: "no-store" });
+    if (res.status === 401) return { ok: false, reason: "not_authenticated" };
+    return (await res.json()) as StatusResponse;
   }
 
   async function evaluateAndRoute() {
@@ -81,7 +72,6 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     if (!session) {
       setSessionUserId(null);
       setProfile(null);
-
       if (!isAuthRoute) safeReplace("/login");
       return;
     }
@@ -89,21 +79,34 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     const userId = session.user.id;
     setSessionUserId(userId);
 
+    const status = await fetchStatus();
+
+    if (!status.ok) {
+      // If we can’t confirm status, route to login (NOT pending)
+      if (!isAuthRoute) safeReplace("/login");
+      setProfile(null);
+      return;
+    }
+
+    const p: Profile = {
+      id: status.userId,
+      email: status.email ?? session.user.email ?? null,
+      display_name: null,
+      role: status.role,
+      approved: status.approved,
+    };
+
+    setProfile(p);
+
     // If they’re on /login or /signup, forward them based on approval
     if (pathname === "/login" || pathname === "/signup") {
-      const p = await fetchProfile(userId);
-      setProfile(p);
-
-      if (p && !p.approved) safeReplace("/pending");
+      if (!p.approved) safeReplace("/pending");
       else safeReplace("/today");
       return;
     }
 
     // For other routes, ensure approved
-    const p = await fetchProfile(userId);
-    setProfile(p);
-
-    if (p && !p.approved) {
+    if (!p.approved) {
       if (pathname !== "/pending") safeReplace("/pending");
       return;
     }
@@ -132,7 +135,8 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       cancelled = true;
       sub?.subscription?.unsubscribe();
     };
-  }, [pathname]); // eslint-disable-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pathname]);
 
   async function handleSignOut() {
     try {
@@ -165,27 +169,17 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   }, [navItems, profile?.role]);
 
   function isActive(href: string) {
-    // exact match for top-level tabs; also allow subroutes under each section
     return pathname === href || pathname.startsWith(href + "/");
   }
 
   if (loading) {
-    return (
-      <div className="min-h-[60vh] flex items-center justify-center text-sm opacity-70">
-        Loading…
-      </div>
-    );
+    return <div className="min-h-[60vh] flex items-center justify-center text-sm opacity-70">Loading…</div>;
   }
 
-  // If we’re on auth routes, just render children (no header/nav)
-  if (!showChrome) {
-    return <>{children}</>;
-  }
+  if (!showChrome) return <>{children}</>;
 
-  // App chrome
   return (
     <div className="min-h-dvh flex flex-col">
-      {/* Header */}
       <header className="sticky top-0 z-50 border-b bg-background/80 backdrop-blur">
         <div className="mx-auto max-w-5xl px-4 py-3 flex items-center justify-between">
           <div className="font-semibold tracking-tight">Disciplined Life</div>
@@ -206,15 +200,13 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         </div>
       </header>
 
-      {/* Main */}
       <main className="flex-1 mx-auto w-full max-w-5xl px-4 py-6 pb-24">{children}</main>
 
-      {/* Bottom nav (colorblind-friendly: no reliance on color alone) */}
       <nav className="fixed bottom-0 left-0 right-0 z-50 border-t bg-background/90 backdrop-blur">
         <div className="mx-auto max-w-5xl px-2 py-2">
           <div className="grid grid-cols-6 gap-1">
             {allowedNav
-              .filter((i) => i.href !== "/admin") // keep admin out of main row (optional)
+              .filter((i) => i.href !== "/admin")
               .slice(0, 6)
               .map((item) => {
                 const active = isActive(item.href);
