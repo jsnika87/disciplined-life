@@ -1,21 +1,14 @@
 // src/lib/supabaseClient.ts
-import { createClient } from "@supabase/supabase-js";
+import { createBrowserClient } from "@supabase/ssr";
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+export function createSupabaseBrowserClient() {
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+  const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
 
-if (!supabaseUrl || !supabaseAnonKey) {
-  throw new Error("Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY");
+  return createBrowserClient(supabaseUrl, supabaseAnonKey, {
+    db: { schema: "disciplined" },
+  });
 }
 
-export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
-  // ✅ Make "disciplined" the default schema so `.from("profiles")`
-  // automatically targets `disciplined.profiles` (not `public.profiles`)
-  db: { schema: "disciplined" },
-
-  auth: {
-    persistSession: true,
-    autoRefreshToken: true,
-    detectSessionInUrl: true,
-  },
-});
+// Back-compat export so existing imports keep working:
+export const supabase = createSupabaseBrowserClient();
