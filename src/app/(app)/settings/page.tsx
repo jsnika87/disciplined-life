@@ -1,9 +1,15 @@
 // src/app/(app)/settings/page.tsx
+export const dynamic = "force-dynamic";
+
 import Link from "next/link";
 import PushSettingsClient from "./PushSettingsClient";
+import { createSupabaseServerClient } from "@/lib/supabaseServer";
 
+export default async function SettingsPage() {
+  // If you don’t need server auth checks here, you can delete these 2 lines.
+  // Keeping it is fine if you want the server session available later.
+  createSupabaseServerClient();
 
-export default function SettingsPage() {
   return (
     <div className="space-y-4">
       <h1 className="text-2xl font-semibold">Settings</h1>
