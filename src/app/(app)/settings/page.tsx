@@ -1,37 +1,52 @@
 // src/app/(app)/settings/page.tsx
-export const dynamic = "force-dynamic";
-
 import Link from "next/link";
 import PushSettingsClient from "./PushSettingsClient";
 import { createSupabaseServerClient } from "@/lib/supabaseServer";
 
+export const dynamic = "force-dynamic";
+
 export default async function SettingsPage() {
-  // If you don’t need server auth checks here, you can delete these 2 lines.
-  // Keeping it is fine if you want the server session available later.
-  createSupabaseServerClient();
+  const supabase = await createSupabaseServerClient();
+
+  // Who is the logged-in user?
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  // Default: not admin
+  let isAdmin = false;
+
+  if (user?.id) {
+    // Pull role from profiles
+    const { data: prof } = await supabase
+      .schema("disciplined")
+      .from("profiles")
+      .select("role")
+      .eq("id", user.id)
+      .single();
+
+    isAdmin = prof?.role === "admin";
+  }
 
   return (
-    <div className="space-y-4">
-      <h1 className="text-2xl font-semibold">Settings</h1>
+    <div className="max-w-3xl mx-auto p-4 space-y-6">
+      <h1 className="text-xl font-semibold">Settings</h1>
 
+      {/* Existing push settings UI */}
       <PushSettingsClient />
 
-      <div className="border rounded-xl p-4 space-y-2">
-        <div className="font-semibold">Account</div>
-        <div className="text-sm opacity-70">Manage your session and preferences.</div>
+      <div className="border rounded">
+        <div className="px-4 py-3 border-b font-medium">Tools</div>
 
-        <div className="pt-2">
-          <Link className="underline" href="/settings/signout">
-            Sign out
-          </Link>
-        </div>
-      </div>
-
-      <div className="border rounded-xl p-4 space-y-2">
-        <div className="font-semibold">Preferences (placeholder)</div>
-        <div className="text-sm opacity-70">
-          Coming next: preferred Bible version, fasting window defaults, notification preferences,
-          optional weight tracking.
+        <div className="p-2">
+          {isAdmin ? (
+            <Link
+              href="/debug"
+              className="block px-3 py-2 rounded hover:bg-black/5 dark:hover:bg-white/10"
+            >
+              Debug (admin)
+            </Link>
+          ) : null}
         </div>
       </div>
     </div>
