@@ -1,50 +1,66 @@
 // src/app/debug/page.tsx
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { supabase } from "@/lib/supabaseClient";
 
 type AnyObj = Record<string, any>;
 
-function isAbortError(e: any) {
-  return (
-    e?.name === "AbortError" ||
-    e?.code === "ABORT_ERR" ||
-    String(e?.message || "").toLowerCase().includes("aborted")
-  );
-}
-
 export default function DebugPage() {
   const [out, setOut] = useState<AnyObj>({ loading: true });
+  const runIdRef = useRef(0);
 
   useEffect(() => {
-    let mounted = true;
+    let isAlive = true;
+    const myRunId = ++runIdRef.current;
 
-    const safeSet = (patch: AnyObj) => {
-      if (!mounted) return;
-      setOut((prev) => ({ ...prev, ...patch }));
+    const safeSetOut = (next: AnyObj) => {
+      // Prevent setting state if we've unmounted or a newer run started
+      if (!isAlive) return;
+      if (runIdRef.current !== myRunId) return;
+      setOut(next);
+    };
+
+    const withTimeout = async <T,>(fn: (signal: AbortSignal) => Promise<T>, ms: number) => {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), ms);
+
+      try {
+        return await fn(controller.signal);
+      } finally {
+        clearTimeout(timeout);
+      }
     };
 
     (async () => {
-      const result: AnyObj = {};
+      const result: AnyObj = { loading: true };
       try {
         // --- Session ---
-        const sessionRes = await supabase.auth.getSession();
-        result.sessionUser = sessionRes.data.session?.user ?? null;
+        try {
+          const session = await supabase.auth.getSession();
+          result.sessionUser = session.data.session?.user ?? null;
+          result.sessionError = session.error ?? null;
+        } catch (e: any) {
+          result.sessionUser = null;
+          result.sessionError = e?.message ?? String(e);
+        }
 
         // --- Profile ---
         if (result.sessionUser?.id) {
-          const prof = await supabase
-            .schema("disciplined")
-            .from("profiles")
-            .select("id,email,role,approved,timezone,updated_at")
-            .eq("id", result.sessionUser.id)
-            .single();
+          try {
+            const prof = await supabase
+              .schema("disciplined")
+              .from("profiles")
+              .select("id,email,role,approved,timezone,updated_at")
+              .eq("id", result.sessionUser.id)
+              .single();
 
-          result.profile = prof.data ?? null;
-          result.profileError = prof.error ?? null;
-        } else {
-          result.profile = null;
+            result.profile = prof.data ?? null;
+            result.profileError = prof.error ?? null;
+          } catch (e: any) {
+            result.profile = null;
+            result.profileError = e?.message ?? String(e);
+          }
         }
 
         // --- PWA / Push diagnostics (client-only) ---
@@ -57,94 +73,87 @@ export default function DebugPage() {
           displayModeStandalone:
             window.matchMedia?.("(display-mode: standalone)")?.matches ?? false,
           navigatorStandalone: anyNav?.standalone ?? null,
-          userAgent: navigator.userAgent,
         };
 
         result.push = {
           supported:
-            "serviceWorker" in navigator &&
-            "PushManager" in window &&
-            "Notification" in window,
+            "serviceWorker" in navigator && "PushManager" in window && "Notification" in window,
           notificationPermission:
             typeof Notification !== "undefined" ? Notification.permission : "N/A",
           hasServiceWorkerController: !!navigator.serviceWorker?.controller,
         };
 
-        // --- Service worker details ---
+        // service worker details
         if ("serviceWorker" in navigator) {
-          const reg = await navigator.serviceWorker.getRegistration();
-          result.serviceWorker = {
-            scope: reg?.scope ?? null,
-            activeScriptURL: (reg?.active && (reg.active as any).scriptURL) || null,
-            waiting: !!reg?.waiting,
-            installing: !!reg?.installing,
-            hasRegistration: !!reg,
-          };
+          try {
+            const reg = await navigator.serviceWorker.getRegistration();
+            result.serviceWorker = {
+              scope: reg?.scope ?? null,
+              activeScriptURL: (reg?.active && (reg.active as any).scriptURL) || null,
+              waiting: !!reg?.waiting,
+              installing: !!reg?.installing,
+            };
 
-          // --- Subscription details (if supported) ---
-          if (reg && "pushManager" in reg) {
-            const sub = await reg.pushManager.getSubscription();
-            result.push.subscription = sub
-              ? {
-                  endpoint: sub.endpoint,
-                  keysPresent: !!sub.toJSON()?.keys,
-                }
-              : null;
-          } else {
-            result.push.subscription = null;
+            if (reg && "pushManager" in reg) {
+              const sub = await reg.pushManager.getSubscription();
+              result.push.subscription = sub
+                ? {
+                    endpoint: sub.endpoint,
+                    keysPresent: !!sub.toJSON()?.keys,
+                  }
+                : null;
+            }
+          } catch (e: any) {
+            result.serviceWorker = { error: e?.message ?? String(e) };
           }
         } else {
           result.serviceWorker = { supported: false };
-          result.push.subscription = null;
         }
 
-        // --- Fetch server push status (must include cookies/session) ---
-        // No AbortController here — iOS/Safari can throw AbortError unexpectedly.
+        // --- Server push status (via app domain) ---
+        // IMPORTANT: If the page unmounts, we abort this fetch, but we do NOT mark it as an error.
         try {
-          const r = await fetch("/api/push/status", {
-            method: "GET",
-            credentials: "include",
-            headers: { "Content-Type": "application/json" },
-            cache: "no-store",
-          });
+          const statusJson = await withTimeout(async (signal) => {
+            const res = await fetch("/api/push/status", {
+              method: "GET",
+              cache: "no-store",
+              headers: { "accept": "application/json" },
+              signal,
+            });
 
-          const text = await r.text();
-          let json: any = null;
-          try {
-            json = JSON.parse(text);
-          } catch {
-            json = { raw: text };
-          }
+            // If your endpoint returns non-200, capture it cleanly
+            const text = await res.text();
+            let parsed: any = null;
+            try {
+              parsed = JSON.parse(text);
+            } catch {
+              parsed = { raw: text };
+            }
 
-          result.pushStatus = {
-            ok: r.ok,
-            status: r.status,
-            body: json,
-          };
+            return { ok: res.ok, status: res.status, body: parsed };
+          }, 10000);
+
+          result.pushStatus = statusJson;
         } catch (e: any) {
-          result.pushStatusError = {
-            name: e?.name ?? null,
-            message: e?.message ?? String(e),
-            aborted: isAbortError(e),
-          };
+          // If this was aborted due to timeout OR unmount, show it but don't fail the whole debug page.
+          if (e?.name === "AbortError") {
+            result.pushStatus = { ok: false, aborted: true, message: e?.message ?? "AbortError" };
+          } else {
+            result.pushStatus = { ok: false, error: e?.message ?? String(e) };
+          }
         }
       } catch (e: any) {
-        // If anything aborts mid-flight, do NOT wipe what we have.
-        if (isAbortError(e)) {
-          result.aborted = true;
-          result.abortMessage = e?.message ?? String(e);
-        } else {
-          result.error = e?.message ?? String(e);
-          result.errorName = e?.name ?? null;
-        }
+        // Only truly unexpected errors land here
+        result.error = e?.message ?? String(e);
       }
 
       result.loading = false;
-      safeSet(result);
+      safeSetOut(result);
     })();
 
     return () => {
-      mounted = false;
+      // This prevents state update + avoids treating cleanup aborts as “real failures”
+      isAlive = false;
     };
   }, []);
 
