@@ -1,14 +1,11 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { supabase } from "@/lib/supabaseClient";
 import { usePathname, useRouter } from "next/navigation";
 
-type Profile = {
-  id: string;
-  role: "pending" | "user" | "admin";
-  approved: boolean;
-};
+type StatusResponse =
+  | { ok: true; userId: string; role: "pending" | "user" | "admin"; approved: boolean; reason?: string }
+  | { ok: false; reason: string; message?: string };
 
 export default function RequireApproved({ children }: { children: React.ReactNode }) {
   const router = useRouter();
@@ -18,50 +15,60 @@ export default function RequireApproved({ children }: { children: React.ReactNod
   const [allowed, setAllowed] = useState(false);
 
   useEffect(() => {
+    const ac = new AbortController();
     let cancelled = false;
 
     async function check() {
       setLoading(true);
       setAllowed(false);
 
-      const { data: userData } = await supabase.auth.getUser();
+      try {
+        const res = await fetch("/api/profile/status", {
+          method: "GET",
+          cache: "no-store",
+          signal: ac.signal,
+        });
 
-      // Not logged in -> login
-      if (!userData.user) {
-        if (!cancelled) router.replace("/login");
-        return;
-      }
+        if (res.status === 401) {
+          if (!cancelled) router.replace("/login");
+          return;
+        }
 
-      // Look up approval status in disciplined.profiles
-      const { data: profile, error } = await supabase
-        .schema("disciplined")
-        .from("profiles")
-        .select("id,role,approved")
-        .eq("id", userData.user.id)
-        .single<Profile>();
+        const data = (await res.json()) as StatusResponse;
 
-      if (error || !profile) {
-        // If profile row is missing, treat as pending (safer default)
-        if (!cancelled) router.replace("/pending");
-        return;
-      }
+        if (!data.ok) {
+          // If we cannot verify, don't shove you to /pending blindly — just go to login
+          // (keeps you from being stuck due to transient aborts)
+          if (!cancelled) router.replace("/login");
+          return;
+        }
 
-      if (!profile.approved) {
-        if (!cancelled) router.replace("/pending");
-        return;
-      }
+        if (!data.approved) {
+          if (!cancelled) router.replace("/pending");
+          return;
+        }
 
-      // Approved -> allow
-      if (!cancelled) {
-        setAllowed(true);
-        setLoading(false);
+        if (!cancelled) {
+          setAllowed(true);
+          setLoading(false);
+        }
+      } catch (e: any) {
+        // If the fetch was aborted due to navigation, do nothing.
+        if (e?.name === "AbortError") return;
+
+        if (!cancelled) {
+          // On unexpected errors, route to login (not pending)
+          router.replace("/login");
+        }
       }
     }
 
     check();
 
-    // Also re-check when route changes (helps if they navigate fast)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    return () => {
+      cancelled = true;
+      ac.abort();
+    };
   }, [router, pathname]);
 
   if (loading && !allowed) {
