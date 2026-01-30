@@ -21,25 +21,8 @@ type NavItem = {
 };
 
 type StatusResponse =
-  | {
-      ok: true;
-      userId: string;
-      role: "pending" | "user" | "admin";
-      approved: boolean;
-      email?: string | null;
-    }
+  | { ok: true; userId: string; role: "pending" | "user" | "admin"; approved: boolean; email?: string | null }
   | { ok: false; reason: string; message?: string };
-
-async function fetchWithTimeout(input: RequestInfo, init: RequestInit, ms: number) {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), ms);
-  try {
-    const res = await fetch(input, { ...init, signal: controller.signal });
-    return res;
-  } finally {
-    clearTimeout(t);
-  }
-}
 
 export default function AppShell({ children }: { children: React.ReactNode }) {
   const router = useRouter();
@@ -48,7 +31,6 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   const [loading, setLoading] = useState(true);
   const [sessionUserId, setSessionUserId] = useState<string | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
-  const [loadHint, setLoadHint] = useState<string>("");
 
   // Prevent redirect storms (Safari)
   const redirectingRef = useRef(false);
@@ -77,91 +59,86 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     }, 1000);
   }
 
-  async function fetchStatus(): Promise<StatusResponse> {
+  async function fetchStatusWithTimeout(ms = 8000): Promise<StatusResponse> {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), ms);
+
     try {
-      const res = await fetchWithTimeout(
-        "/api/profile/status",
-        { method: "GET", cache: "no-store" },
-        8000
-      );
+      const res = await fetch("/api/profile/status", {
+        method: "GET",
+        cache: "no-store",
+        signal: controller.signal,
+      });
 
       if (res.status === 401) return { ok: false, reason: "not_authenticated" };
-
-      const data = (await res.json()) as StatusResponse;
-      return data;
+      return (await res.json()) as StatusResponse;
     } catch (e: any) {
       if (e?.name === "AbortError") return { ok: false, reason: "timeout" };
       return { ok: false, reason: "network_error", message: e?.message ?? String(e) };
+    } finally {
+      clearTimeout(t);
     }
   }
 
-  async function evaluateAndRoute() {
-    setLoadHint("");
+  async function initAuthAndProfile() {
+    setLoading(true);
 
-    // Session fetch can hang on iOS reloads; keep it bounded
-    let session: any = null;
-    try {
-      const sessionPromise = supabase.auth.getSession();
-      session = await Promise.race([
-        sessionPromise,
-        new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 8000)),
-      ]);
-    } catch {
-      session = null;
-    }
+    // 1) Session
+    const { data: sessionData } = await supabase.auth.getSession();
+    const session = sessionData.session;
 
-    const sessionData = session?.data?.session ?? null;
-
-    if (!sessionData) {
+    if (!session) {
       setSessionUserId(null);
       setProfile(null);
+      setLoading(false);
+
       if (!isAuthRoute) safeReplace("/login");
       return;
     }
 
-    const userId = sessionData.user.id;
-    setSessionUserId(userId);
+    setSessionUserId(session.user.id);
 
-    const status = await fetchStatus();
+    // 2) Profile status (ONE network hit per app start / auth change)
+    const status = await fetchStatusWithTimeout(8000);
 
     if (!status.ok) {
       // If we can’t confirm status, route to login (NOT pending)
-      setLoadHint(status.reason === "timeout" ? "Server check timed out" : "Could not verify session");
-      if (!isAuthRoute) safeReplace("/login");
       setProfile(null);
+      setLoading(false);
+      if (!isAuthRoute) safeReplace("/login");
       return;
     }
 
     const p: Profile = {
       id: status.userId,
-      email: status.email ?? sessionData.user.email ?? null,
+      email: status.email ?? session.user.email ?? null,
       display_name: null,
       role: status.role,
       approved: status.approved,
     };
 
     setProfile(p);
+    setLoading(false);
 
-    // If they’re on /login or /signup, forward them based on approval
+    // Forward away from auth pages if already authed
     if (pathname === "/login" || pathname === "/signup") {
       if (!p.approved) safeReplace("/pending");
       else safeReplace("/today");
       return;
     }
 
-    // For other routes, ensure approved
-    if (!p.approved) {
-      if (pathname !== "/pending") safeReplace("/pending");
-      return;
+    if (!p.approved && pathname !== "/pending") {
+      safeReplace("/pending");
     }
   }
 
+  // Initial load + auth changes
   useEffect(() => {
     let cancelled = false;
 
     (async () => {
       try {
-        await evaluateAndRoute();
+        await initAuthAndProfile();
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -169,7 +146,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
 
     const { data: sub } = supabase.auth.onAuthStateChange(async () => {
       try {
-        await evaluateAndRoute();
+        await initAuthAndProfile();
       } catch {
         // ignore
       }
@@ -180,7 +157,33 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       sub?.subscription?.unsubscribe();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pathname]);
+  }, []);
+
+  // Lightweight route-guard on navigation (NO fetch)
+  useEffect(() => {
+    if (loading) return;
+
+    // Not logged in → must be on auth route
+    if (!sessionUserId) {
+      if (!isAuthRoute) safeReplace("/login");
+      return;
+    }
+
+    // Logged in but no profile (transient) → avoid loops; let init handle
+    if (!profile) return;
+
+    // Not approved → go pending
+    if (!profile.approved) {
+      if (pathname !== "/pending") safeReplace("/pending");
+      return;
+    }
+
+    // Approved → don’t hang out on login/signup/pending
+    if (pathname === "/login" || pathname === "/signup" || pathname === "/pending") {
+      safeReplace("/today");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pathname, loading, sessionUserId, profile?.approved]);
 
   async function handleSignOut() {
     try {
@@ -217,19 +220,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   }
 
   if (loading) {
-    return (
-      <div className="min-h-[60vh] flex flex-col items-center justify-center text-sm opacity-70 gap-3">
-        <div>Loading…</div>
-        {loadHint ? <div className="text-xs opacity-70">{loadHint}</div> : null}
-        <button
-          type="button"
-          onClick={() => router.replace("/login")}
-          className="rounded-lg border px-3 py-2 text-sm opacity-90"
-        >
-          Go to Login
-        </button>
-      </div>
-    );
+    return <div className="min-h-[60vh] flex items-center justify-center text-sm opacity-70">Loading…</div>;
   }
 
   if (!showChrome) return <>{children}</>;
@@ -242,9 +233,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
 
           <div className="flex items-center gap-3">
             {profile?.role ? (
-              <span className="text-sm opacity-80">
-                {profile.role === "admin" ? "Admin" : "User"}
-              </span>
+              <span className="text-sm opacity-80">{profile.role === "admin" ? "Admin" : "User"}</span>
             ) : null}
 
             <button

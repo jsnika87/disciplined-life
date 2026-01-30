@@ -5,8 +5,10 @@ self.addEventListener("install", () => {
   // The new SW will activate after old tabs close naturally.
 });
 
-self.addEventListener("activate", () => {
-  // Do NOT clients.claim() on iOS PWAs; same reason (mixed versions).
+self.addEventListener("activate", (event) => {
+  // Safe: once this SW activates, take control of clients immediately.
+  // (We are NOT forcing activation early via skipWaiting.)
+  event.waitUntil(self.clients.claim());
 });
 
 self.addEventListener("push", (event) => {
