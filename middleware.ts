@@ -22,19 +22,24 @@ export async function middleware(request: NextRequest) {
   });
 
   try {
-    // refresh session cookies when needed
+    // Refresh session cookies when needed, but NEVER block navigation if it fails.
     await supabase.auth.getUser();
   } catch {
-    // never block middleware
+    // ignore
   }
 
   return response;
 }
 
-// IMPORTANT: do NOT run middleware on api routes or PWA assets.
-// Reduces iOS weirdness during push toggles + prevents cookie churn on /sw.js etc.
+/**
+ * IMPORTANT:
+ * Do NOT run middleware on:
+ * - /api/* (prevents auth/cookie churn during fetches)
+ * - service worker + manifest + icons (prevents iOS “brick” mixed-state)
+ * - Next static assets
+ */
 export const config = {
   matcher: [
-    "/((?!_next/static|_next/image|favicon.ico|robots.txt|sitemap.xml|api|sw.js|manifest.webmanifest|icons/).*)",
+    "/((?!api/|_next/static|_next/image|favicon.ico|favicon-|robots.txt|sitemap.xml|sw.js|manifest.webmanifest|icons/|apple-touch-icon).*)",
   ],
 };
