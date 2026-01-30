@@ -1,6 +1,60 @@
+import fs from "fs";
+import path from "path";
 import { DateTime } from "luxon";
 import webpush from "web-push";
 import { createClient } from "@supabase/supabase-js";
+
+/**
+ * Cron/one-off node runs do NOT automatically get Next's env loading.
+ * So we load .env.local (and .env) ourselves, but only to fill missing vars.
+ */
+function loadEnvFile(filePath) {
+  try {
+    if (!fs.existsSync(filePath)) return;
+    const raw = fs.readFileSync(filePath, "utf8");
+    const lines = raw.split(/\r?\n/);
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+
+      const eq = trimmed.indexOf("=");
+      if (eq === -1) continue;
+
+      const key = trimmed.slice(0, eq).trim();
+      let val = trimmed.slice(eq + 1).trim();
+
+      // Strip optional quotes
+      if (
+        (val.startsWith('"') && val.endsWith('"')) ||
+        (val.startsWith("'") && val.endsWith("'"))
+      ) {
+        val = val.slice(1, -1);
+      }
+
+      // Only set if not already present in the environment
+      if (!process.env[key] && key) {
+        process.env[key] = val;
+      }
+    }
+  } catch (e) {
+    // Don't crash cron due to env parsing
+    console.warn(`[push-cron] env load failed for ${filePath}:`, e?.message ?? String(e));
+  }
+}
+
+function ensureEnvLoaded() {
+  // Prefer project root near this file
+  const projectRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+  loadEnvFile(path.join(projectRoot, ".env.local"));
+  loadEnvFile(path.join(projectRoot, ".env"));
+
+  // Also try cwd if someone runs from elsewhere
+  loadEnvFile(path.join(process.cwd(), ".env.local"));
+  loadEnvFile(path.join(process.cwd(), ".env"));
+}
+
+ensureEnvLoaded();
 
 function need(name) {
   const v = process.env[name];
@@ -14,16 +68,16 @@ const SERVICE_KEY = need("SUPABASE_SERVICE_ROLE_KEY");
 const VAPID_PUBLIC = need("NEXT_PUBLIC_VAPID_PUBLIC_KEY");
 const VAPID_PRIVATE = need("VAPID_PRIVATE_KEY");
 
-webpush.setVapidDetails("mailto:admin@disciplined.life", VAPID_PUBLIC, VAPID_PRIVATE);
+const VAPID_SUBJECT = process.env.VAPID_SUBJECT || "mailto:admin@disciplined.life";
 
-const admin = createClient(SUPABASE_URL, SERVICE_KEY, { auth: { persistSession: false } });
+webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC, VAPID_PRIVATE);
+
+const admin = createClient(SUPABASE_URL, SERVICE_KEY, {
+  auth: { persistSession: false },
+});
 
 function toSubscriptionRow(row) {
   return { endpoint: row.endpoint, keys: { p256dh: row.p256dh, auth: row.auth } };
-}
-
-function mod1440(n) {
-  return ((n % 1440) + 1440) % 1440;
 }
 
 async function alreadySent(userId, kind, localDate) {
@@ -46,6 +100,7 @@ async function markSent(userId, kind, localDate, localMin) {
     .from("push_send_log")
     .insert({ user_id: userId, kind, local_date: localDate, local_min: localMin });
 
+  // allow idempotency if you added a unique constraint
   if (error && !String(error.message).toLowerCase().includes("duplicate")) throw error;
 }
 
@@ -85,6 +140,18 @@ async function sendPush(userId, payload) {
   }
 }
 
+/**
+ * If cron runs every 5 minutes, exact-minute equality checks will miss events.
+ * This returns true if we're within the last N minutes (including exact minute).
+ */
+function isWithinLastMinutes(nowMin, targetMin, windowSize) {
+  if (typeof targetMin !== "number" || !Number.isFinite(targetMin)) return false;
+  const DAY = 1440;
+  // diff in [0..1439] where diff=0 means exact match, diff=1 means 1 min after, etc.
+  const diff = (nowMin - targetMin + DAY) % DAY;
+  return diff >= 0 && diff < windowSize;
+}
+
 async function areAllPillarsCompletedToday(userId, localDateISO, tz) {
   // v1 compatibility with your current UTC-based entry_date
   const noonLocal = DateTime.fromISO(localDateISO, { zone: tz }).set({ hour: 12, minute: 0 });
@@ -118,6 +185,9 @@ async function main() {
   const users = await fetchUserSettings();
   let sentCount = 0;
 
+  // Must match your cron: */5
+  const CRON_WINDOW_MINUTES = 5;
+
   for (const u of users) {
     if (!u.push_enabled) continue;
 
@@ -125,68 +195,37 @@ async function main() {
     const now = DateTime.now().setZone(tz);
 
     const localDate = now.toISODate();
-    const localMin = now.hour * 60 + now.minute;
+    const localMinNow = now.hour * 60 + now.minute;
 
-    // (1) Fasting/Eating window transitions + 30-min warning
+    // (1) Fasting/Eating window transitions
     if (u.push_fasting_windows) {
-      const startMin = Number(u.eating_start_min);
-      const endMin = Number(u.eating_end_min);
-
-      if (!Number.isFinite(startMin) || !Number.isFinite(endMin)) {
-        // if settings are missing/invalid, skip safely
-      } else {
-        // If endMin < startMin, the eating window crosses midnight.
-        // For notifications happening after midnight (localMin < endMin),
-        // log against "yesterday" to avoid double-send in the new date.
-        const windowKeyDate =
-          endMin < startMin && localMin < endMin ? now.minus({ days: 1 }).toISODate() : localDate;
-
-        // A) Eating window opened
-        if (localMin === startMin) {
-          const kind = "window_start";
-          if (!(await alreadySent(u.user_id, kind, windowKeyDate))) {
-            const res = await sendPush(u.user_id, {
-              title: "Eating window is open",
-              body: "You’re in your eating window now.",
-              data: { url: "/today" },
-            });
-            if (res.ok) {
-              await markSent(u.user_id, kind, windowKeyDate, localMin);
-              sentCount++;
-            }
+      if (isWithinLastMinutes(localMinNow, u.eating_start_min, CRON_WINDOW_MINUTES)) {
+        const kind = "window_start";
+        if (!(await alreadySent(u.user_id, kind, localDate))) {
+          const res = await sendPush(u.user_id, {
+            title: "Eating window is open",
+            body: "You’re in your eating window now.",
+            data: { url: "/today" },
+          });
+          if (res.ok) {
+            // store the intended minute, not “now”
+            await markSent(u.user_id, kind, localDate, u.eating_start_min);
+            sentCount++;
           }
         }
+      }
 
-        // B) Eating window ends soon (30 min before end)
-        const warnMin = mod1440(endMin - 30);
-        if (localMin === warnMin) {
-          const kind = "window_ending_soon";
-          if (!(await alreadySent(u.user_id, kind, windowKeyDate))) {
-            const res = await sendPush(u.user_id, {
-              title: "Eating window ends soon",
-              body: "30 minutes left in your eating window.",
-              data: { url: "/today" },
-            });
-            if (res.ok) {
-              await markSent(u.user_id, kind, windowKeyDate, localMin);
-              sentCount++;
-            }
-          }
-        }
-
-        // C) Fasting window started (eating window ended)
-        if (localMin === endMin) {
-          const kind = "window_end";
-          if (!(await alreadySent(u.user_id, kind, windowKeyDate))) {
-            const res = await sendPush(u.user_id, {
-              title: "Fasting window started",
-              body: "Eating window closed. You’re fasting now.",
-              data: { url: "/today" },
-            });
-            if (res.ok) {
-              await markSent(u.user_id, kind, windowKeyDate, localMin);
-              sentCount++;
-            }
+      if (isWithinLastMinutes(localMinNow, u.eating_end_min, CRON_WINDOW_MINUTES)) {
+        const kind = "window_end";
+        if (!(await alreadySent(u.user_id, kind, localDate))) {
+          const res = await sendPush(u.user_id, {
+            title: "Fasting window started",
+            body: "Eating window closed. You’re fasting now.",
+            data: { url: "/today" },
+          });
+          if (res.ok) {
+            await markSent(u.user_id, kind, localDate, u.eating_end_min);
+            sentCount++;
           }
         }
       }
@@ -194,7 +233,7 @@ async function main() {
 
     // (2) Daily reminder if incomplete
     if (u.push_daily_reminder) {
-      if (localMin === u.daily_reminder_time_min) {
+      if (isWithinLastMinutes(localMinNow, u.daily_reminder_time_min, CRON_WINDOW_MINUTES)) {
         const kind = "daily_reminder";
         if (!(await alreadySent(u.user_id, kind, localDate))) {
           const allDone = await areAllPillarsCompletedToday(u.user_id, localDate, tz);
@@ -205,12 +244,12 @@ async function main() {
               data: { url: "/today" },
             });
             if (res.ok) {
-              await markSent(u.user_id, kind, localDate, localMin);
+              await markSent(u.user_id, kind, localDate, u.daily_reminder_time_min);
               sentCount++;
             }
           } else {
             // mark so we don't re-check on retries
-            await markSent(u.user_id, kind, localDate, localMin);
+            await markSent(u.user_id, kind, localDate, u.daily_reminder_time_min);
           }
         }
       }
