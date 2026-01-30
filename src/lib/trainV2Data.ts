@@ -1,6 +1,6 @@
 // src/lib/trainV2Data.ts
 import { supabase } from "@/lib/supabaseClient";
-import type { TrainBodyMetrics, TrainDay, TrainSession, TrainSessionType } from "./trainV2";
+import type { BodyMetrics, TrainDay, TrainSession, TrainSessionType } from "./trainV2";
 
 async function requireUserId(): Promise<string> {
   const { data, error } = await supabase.auth.getUser();
@@ -10,9 +10,11 @@ async function requireUserId(): Promise<string> {
   return uid;
 }
 
-// ---------------------------
-// Train Day
-// ---------------------------
+/**
+ * TRAIN DAY
+ * Ensures there is a train_days row for this user + local date.
+ * IMPORTANT: inserts MUST include user_id to satisfy RLS.
+ */
 export async function getOrCreateTrainDay(localDate: string): Promise<TrainDay> {
   const uid = await requireUserId();
 
@@ -38,14 +40,17 @@ export async function getOrCreateTrainDay(localDate: string): Promise<TrainDay> 
   return created.data;
 }
 
-// ---------------------------
-// Sessions
-// ---------------------------
+/**
+ * SESSIONS
+ */
 export async function listSessions(dayId: string): Promise<TrainSession[]> {
+  const uid = await requireUserId();
+
   const res = await supabase
     .schema("disciplined")
     .from("train_sessions")
     .select("*")
+    .eq("user_id", uid)
     .eq("day_id", dayId)
     .order("created_at", { ascending: true });
 
@@ -53,16 +58,18 @@ export async function listSessions(dayId: string): Promise<TrainSession[]> {
   return (res.data ?? []) as TrainSession[];
 }
 
-export async function createSession(dayId: string, session_type: TrainSessionType): Promise<TrainSession> {
+export async function createSession(dayId: string, sessionType: TrainSessionType): Promise<TrainSession> {
+  const uid = await requireUserId();
+
+  // IMPORTANT: include user_id so RLS WITH CHECK passes
   const res = await supabase
     .schema("disciplined")
     .from("train_sessions")
     .insert({
+      user_id: uid,
       day_id: dayId,
-      session_type,
-      title: null,
-      notes: null,
-      duration_sec: null,
+      session_type: sessionType,
+      started_at: new Date().toISOString(),
     })
     .select("*")
     .single<TrainSession>();
@@ -75,19 +82,36 @@ export async function updateSession(
   sessionId: string,
   patch: Partial<Pick<TrainSession, "title" | "notes" | "duration_sec">>
 ): Promise<void> {
-  const res = await supabase.schema("disciplined").from("train_sessions").update(patch).eq("id", sessionId);
+  const uid = await requireUserId();
+
+  const res = await supabase
+    .schema("disciplined")
+    .from("train_sessions")
+    .update({ ...patch, updated_at: new Date().toISOString() })
+    .eq("id", sessionId)
+    .eq("user_id", uid);
+
   if (res.error) throw res.error;
 }
 
 export async function deleteSession(sessionId: string): Promise<void> {
-  const res = await supabase.schema("disciplined").from("train_sessions").delete().eq("id", sessionId);
+  const uid = await requireUserId();
+
+  const res = await supabase
+    .schema("disciplined")
+    .from("train_sessions")
+    .delete()
+    .eq("id", sessionId)
+    .eq("user_id", uid);
+
   if (res.error) throw res.error;
 }
 
-// ---------------------------
-// Body Metrics (weight/waist)
-// ---------------------------
-export async function getBodyMetrics(localDate: string): Promise<TrainBodyMetrics | null> {
+/**
+ * BODY METRICS
+ * One row per user per local_date.
+ */
+export async function getBodyMetrics(localDate: string): Promise<BodyMetrics | null> {
   const uid = await requireUserId();
 
   const res = await supabase
@@ -96,7 +120,7 @@ export async function getBodyMetrics(localDate: string): Promise<TrainBodyMetric
     .select("*")
     .eq("user_id", uid)
     .eq("local_date", localDate)
-    .maybeSingle<TrainBodyMetrics>();
+    .maybeSingle<BodyMetrics>();
 
   if (res.error) throw res.error;
   return res.data ?? null;
@@ -104,7 +128,7 @@ export async function getBodyMetrics(localDate: string): Promise<TrainBodyMetric
 
 export async function upsertBodyMetrics(
   localDate: string,
-  patch: { weight_lbs: number | null; waist_in: number | null }
+  input: { weight_lbs: number | null; waist_in: number | null }
 ): Promise<void> {
   const uid = await requireUserId();
 
@@ -115,7 +139,9 @@ export async function upsertBodyMetrics(
       {
         user_id: uid,
         local_date: localDate,
-        ...patch,
+        weight_lbs: input.weight_lbs,
+        waist_in: input.waist_in,
+        updated_at: new Date().toISOString(),
       },
       { onConflict: "user_id,local_date" }
     );
