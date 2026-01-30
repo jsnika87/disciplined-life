@@ -15,7 +15,7 @@ function urlBase64ToUint8Array(base64String: string) {
   return outputArray;
 }
 
-async function waitForController(timeoutMs = 5000) {
+async function waitForController(timeoutMs = 6000) {
   if (navigator.serviceWorker.controller) return true;
 
   return await new Promise<boolean>((resolve) => {
@@ -50,10 +50,13 @@ export default function PushSettingsClient() {
     return "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
   }, []);
 
-  async function fetchStatusFromServer() {
+  async function getAccessToken(): Promise<string | null> {
     const { data } = await supabase.auth.getSession();
-    const token = data.session?.access_token;
+    return data.session?.access_token ?? null;
+  }
 
+  async function fetchStatusFromServer() {
+    const token = await getAccessToken();
     if (!token) {
       setStatus("disabled");
       return;
@@ -69,15 +72,9 @@ export default function PushSettingsClient() {
     setStatus(json?.subscribed ? "enabled" : "disabled");
   }
 
-  // ensure the user has a settings row (non-blocking)
+  // ensure settings row (never bricks)
   useEffect(() => {
-    (async () => {
-      try {
-        await ensureUserSettings();
-      } catch (e: any) {
-        console.error("ensureUserSettings failed:", e);
-      }
-    })();
+    ensureUserSettings().catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -118,7 +115,9 @@ export default function PushSettingsClient() {
 
     if (!standalone) {
       setStatus("error");
-      setDetail("On iPhone, push works only after installing to Home Screen. Install it, reopen, then try Enable.");
+      setDetail(
+        "On iPhone, push works only after installing to Home Screen. Install it, reopen, then try Enable."
+      );
       return;
     }
 
@@ -126,7 +125,6 @@ export default function PushSettingsClient() {
     setDetail("");
 
     try {
-      // Make sure SW is ready and up-to-date
       const reg = await navigator.serviceWorker.ready;
 
       // Ask browser to check for updated SW (helps after deploy)
@@ -136,7 +134,6 @@ export default function PushSettingsClient() {
         // ignore
       }
 
-      // Ensure the page is controlled before subscribing (iOS requirement-ish)
       const controlled = await waitForController(6000);
       if (!controlled) {
         setStatus("error");
@@ -163,8 +160,7 @@ export default function PushSettingsClient() {
       const p256dh = keys.p256dh;
       const auth = keys.auth;
 
-      const { data } = await supabase.auth.getSession();
-      const token = data.session?.access_token;
+      const token = await getAccessToken();
       if (!token) throw new Error("Not logged in");
 
       const res = await fetch("/api/push/subscribe", {
@@ -187,10 +183,7 @@ export default function PushSettingsClient() {
       }
 
       setStatus("enabled");
-
-      // IMPORTANT: iOS PWA can enter mixed-version state after SW/push changes.
-      // One controlled reload prevents the “stuck Loading…” brick.
-      setTimeout(() => window.location.reload(), 250);
+      setDetail("Enabled. (No reload — iOS PWAs can brick on forced reloads.)");
     } catch (e: any) {
       setStatus("error");
       setDetail(e?.message ?? "Unknown error");
@@ -206,8 +199,7 @@ export default function PushSettingsClient() {
     setDetail("");
 
     try {
-      const { data } = await supabase.auth.getSession();
-      const token = data.session?.access_token;
+      const token = await getAccessToken();
       if (!token) throw new Error("Not logged in");
 
       // remove from server
@@ -227,9 +219,7 @@ export default function PushSettingsClient() {
       if (existing) await existing.unsubscribe();
 
       setStatus("disabled");
-
-      // Same reason: prevent iOS PWA mixed-state hang
-      setTimeout(() => window.location.reload(), 250);
+      setDetail("Disabled. (No reload — avoids Next Server Action mismatch.)");
     } catch (e: any) {
       setStatus("error");
       setDetail(e?.message ?? "Unknown error");
@@ -258,9 +248,7 @@ export default function PushSettingsClient() {
           <div className="font-medium">Push notifications</div>
           <div className="text-sm opacity-70">Enable reminders and alerts on this device.</div>
         </div>
-        <div className="text-sm px-3 py-1 rounded-full border">
-          {statusLabel}
-        </div>
+        <div className="text-sm px-3 py-1 rounded-full border">{statusLabel}</div>
       </div>
 
       {detail ? <div className="text-sm text-red-400">{detail}</div> : null}

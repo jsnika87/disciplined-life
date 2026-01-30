@@ -3,7 +3,6 @@ import { NextResponse, type NextRequest } from "next/server";
 import { createServerClient } from "@supabase/ssr";
 
 export async function middleware(request: NextRequest) {
-  // Create the response we will return
   const response = NextResponse.next();
 
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
@@ -15,7 +14,6 @@ export async function middleware(request: NextRequest) {
         return request.cookies.getAll();
       },
       setAll(cookiesToSet) {
-        // IMPORTANT: only set on the response
         cookiesToSet.forEach(({ name, value, options }) => {
           response.cookies.set(name, value, options);
         });
@@ -23,13 +21,20 @@ export async function middleware(request: NextRequest) {
     },
   });
 
-  // This refreshes session cookies when needed
-  await supabase.auth.getUser();
+  try {
+    // refresh session cookies when needed
+    await supabase.auth.getUser();
+  } catch {
+    // never block middleware
+  }
 
   return response;
 }
 
-// Run middleware on everything except static assets
+// IMPORTANT: do NOT run middleware on api routes or PWA assets.
+// Reduces iOS weirdness during push toggles + prevents cookie churn on /sw.js etc.
 export const config = {
-  matcher: ["/((?!_next/static|_next/image|favicon.ico|robots.txt|sitemap.xml).*)"],
+  matcher: [
+    "/((?!_next/static|_next/image|favicon.ico|robots.txt|sitemap.xml|api|sw.js|manifest.webmanifest|icons/).*)",
+  ],
 };
