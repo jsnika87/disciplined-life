@@ -36,6 +36,13 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   const redirectingRef = useRef(false);
   const lastRedirectAtRef = useRef<number>(0);
 
+  // Avoid overlapping init calls (iOS resume can fire multiple events)
+  const initInFlightRef = useRef(false);
+  const lastInitAtRef = useRef<number>(0);
+
+  // Safety net: don’t let Loading… hang forever
+  const loadingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const isAuthRoute = useMemo(() => {
     return pathname === "/login" || pathname === "/signup" || pathname === "/pending";
   }, [pathname]);
@@ -57,6 +64,24 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     setTimeout(() => {
       redirectingRef.current = false;
     }, 1000);
+  }
+
+  function beginLoading() {
+    setLoading(true);
+
+    if (loadingTimeoutRef.current) clearTimeout(loadingTimeoutRef.current);
+    loadingTimeoutRef.current = setTimeout(() => {
+      // If something got stuck (iOS resume), force UI back
+      setLoading(false);
+    }, 12000);
+  }
+
+  function endLoading() {
+    setLoading(false);
+    if (loadingTimeoutRef.current) {
+      clearTimeout(loadingTimeoutRef.current);
+      loadingTimeoutRef.current = null;
+    }
   }
 
   async function fetchStatusWithTimeout(ms = 8000): Promise<StatusResponse> {
@@ -81,54 +106,68 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   }
 
   async function initAuthAndProfile() {
-    setLoading(true);
+    // throttle to avoid repeated calls from resume events
+    const now = Date.now();
+    if (initInFlightRef.current) return;
+    if (now - lastInitAtRef.current < 1500) return;
 
-    // 1) Session
-    const { data: sessionData } = await supabase.auth.getSession();
-    const session = sessionData.session;
+    initInFlightRef.current = true;
+    lastInitAtRef.current = now;
 
-    if (!session) {
-      setSessionUserId(null);
-      setProfile(null);
-      setLoading(false);
+    beginLoading();
 
-      if (!isAuthRoute) safeReplace("/login");
-      return;
-    }
+    try {
+      // 1) Session
+      const { data: sessionData } = await supabase.auth.getSession();
+      const session = sessionData.session;
 
-    setSessionUserId(session.user.id);
+      if (!session) {
+        setSessionUserId(null);
+        setProfile(null);
+        endLoading();
 
-    // 2) Profile status (ONE network hit per app start / auth change)
-    const status = await fetchStatusWithTimeout(8000);
+        if (!isAuthRoute) safeReplace("/login");
+        return;
+      }
 
-    if (!status.ok) {
-      // If we can’t confirm status, route to login (NOT pending)
-      setProfile(null);
-      setLoading(false);
-      if (!isAuthRoute) safeReplace("/login");
-      return;
-    }
+      setSessionUserId(session.user.id);
 
-    const p: Profile = {
-      id: status.userId,
-      email: status.email ?? session.user.email ?? null,
-      display_name: null,
-      role: status.role,
-      approved: status.approved,
-    };
+      // 2) Profile status (ONE network hit per app start / auth change / resume)
+      const status = await fetchStatusWithTimeout(8000);
 
-    setProfile(p);
-    setLoading(false);
+      if (!status.ok) {
+        // If we can’t confirm status, route to login (NOT pending)
+        setProfile(null);
+        endLoading();
+        if (!isAuthRoute) safeReplace("/login");
+        return;
+      }
 
-    // Forward away from auth pages if already authed
-    if (pathname === "/login" || pathname === "/signup") {
-      if (!p.approved) safeReplace("/pending");
-      else safeReplace("/today");
-      return;
-    }
+      const p: Profile = {
+        id: status.userId,
+        email: status.email ?? session.user.email ?? null,
+        display_name: null,
+        role: status.role,
+        approved: status.approved,
+      };
 
-    if (!p.approved && pathname !== "/pending") {
-      safeReplace("/pending");
+      setProfile(p);
+      endLoading();
+
+      // Forward away from auth pages if already authed
+      if (pathname === "/login" || pathname === "/signup") {
+        if (!p.approved) safeReplace("/pending");
+        else safeReplace("/today");
+        return;
+      }
+
+      if (!p.approved && pathname !== "/pending") {
+        safeReplace("/pending");
+      }
+    } finally {
+      initInFlightRef.current = false;
+      // ensure we never stay stuck
+      endLoading();
     }
   }
 
@@ -140,7 +179,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       try {
         await initAuthAndProfile();
       } finally {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) endLoading();
       }
     })();
 
@@ -155,9 +194,26 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     return () => {
       cancelled = true;
       sub?.subscription?.unsubscribe();
+      if (loadingTimeoutRef.current) clearTimeout(loadingTimeoutRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Resume handler (iOS PWA app switching)
+  useEffect(() => {
+    const onResume = () => {
+      // Always clear any stuck loader immediately
+      endLoading();
+
+      // Re-check auth/profile (throttled inside)
+      // This prevents stale session/profile state after iOS suspension
+      void initAuthAndProfile();
+    };
+
+    window.addEventListener("dl:pwa-resume", onResume);
+    return () => window.removeEventListener("dl:pwa-resume", onResume);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pathname, isAuthRoute]);
 
   // Lightweight route-guard on navigation (NO fetch)
   useEffect(() => {
