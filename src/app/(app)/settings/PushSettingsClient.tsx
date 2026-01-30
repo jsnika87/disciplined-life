@@ -15,7 +15,7 @@ function urlBase64ToUint8Array(base64String: string) {
   return outputArray;
 }
 
-async function waitForController(timeoutMs = 6000) {
+async function waitForController(timeoutMs = 5000) {
   if (navigator.serviceWorker.controller) return true;
 
   return await new Promise<boolean>((resolve) => {
@@ -45,18 +45,19 @@ export default function PushSettingsClient() {
   const [busy, setBusy] = useState(false);
   const [detail, setDetail] = useState<string>("");
 
+  // test push UI
+  const [testBusy, setTestBusy] = useState(false);
+  const [testResult, setTestResult] = useState<string>("");
+
   const supported = useMemo(() => {
     if (typeof window === "undefined") return false;
     return "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
   }, []);
 
-  async function getAccessToken(): Promise<string | null> {
-    const { data } = await supabase.auth.getSession();
-    return data.session?.access_token ?? null;
-  }
-
   async function fetchStatusFromServer() {
-    const token = await getAccessToken();
+    const { data } = await supabase.auth.getSession();
+    const token = data.session?.access_token;
+
     if (!token) {
       setStatus("disabled");
       return;
@@ -72,9 +73,15 @@ export default function PushSettingsClient() {
     setStatus(json?.subscribed ? "enabled" : "disabled");
   }
 
-  // ensure settings row (never bricks)
+  // ensure the user has a settings row (non-blocking)
   useEffect(() => {
-    ensureUserSettings().catch(() => {});
+    (async () => {
+      try {
+        await ensureUserSettings();
+      } catch (e: any) {
+        console.error("ensureUserSettings failed:", e);
+      }
+    })();
   }, []);
 
   useEffect(() => {
@@ -115,9 +122,7 @@ export default function PushSettingsClient() {
 
     if (!standalone) {
       setStatus("error");
-      setDetail(
-        "On iPhone, push works only after installing to Home Screen. Install it, reopen, then try Enable."
-      );
+      setDetail("On iPhone, push works only after installing to Home Screen. Install it, reopen, then try Enable.");
       return;
     }
 
@@ -127,7 +132,6 @@ export default function PushSettingsClient() {
     try {
       const reg = await navigator.serviceWorker.ready;
 
-      // Ask browser to check for updated SW (helps after deploy)
       try {
         await reg.update();
       } catch {
@@ -160,7 +164,8 @@ export default function PushSettingsClient() {
       const p256dh = keys.p256dh;
       const auth = keys.auth;
 
-      const token = await getAccessToken();
+      const { data } = await supabase.auth.getSession();
+      const token = data.session?.access_token;
       if (!token) throw new Error("Not logged in");
 
       const res = await fetch("/api/push/subscribe", {
@@ -183,7 +188,6 @@ export default function PushSettingsClient() {
       }
 
       setStatus("enabled");
-      setDetail("Enabled. (No reload — iOS PWAs can brick on forced reloads.)");
     } catch (e: any) {
       setStatus("error");
       setDetail(e?.message ?? "Unknown error");
@@ -199,10 +203,10 @@ export default function PushSettingsClient() {
     setDetail("");
 
     try {
-      const token = await getAccessToken();
+      const { data } = await supabase.auth.getSession();
+      const token = data.session?.access_token;
       if (!token) throw new Error("Not logged in");
 
-      // remove from server
       const res = await fetch("/api/push/unsubscribe", {
         method: "POST",
         headers: { Authorization: `Bearer ${token}` },
@@ -213,18 +217,45 @@ export default function PushSettingsClient() {
         throw new Error(j?.error ?? j?.reason ?? "Unsubscribe failed");
       }
 
-      // remove browser subscription too
       const reg = await navigator.serviceWorker.ready;
       const existing = await reg.pushManager.getSubscription();
       if (existing) await existing.unsubscribe();
 
       setStatus("disabled");
-      setDetail("Disabled. (No reload — avoids Next Server Action mismatch.)");
     } catch (e: any) {
       setStatus("error");
       setDetail(e?.message ?? "Unknown error");
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function sendTestPush() {
+    setTestBusy(true);
+    setTestResult("");
+
+    try {
+      const { data } = await supabase.auth.getSession();
+      const token = data.session?.access_token;
+      if (!token) throw new Error("Not logged in");
+
+      const res = await fetch("/api/push/test", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        cache: "no-store",
+      });
+
+      const json = await res.json().catch(() => ({}));
+
+      if (!res.ok || !json?.ok) {
+        throw new Error(json?.reason ?? json?.message ?? `HTTP ${res.status}`);
+      }
+
+      setTestResult("✅ Test push sent. Lock your phone or go Home Screen and wait a few seconds.");
+    } catch (e: any) {
+      setTestResult(`❌ Test push failed: ${e?.message ?? "Unknown error"}`);
+    } finally {
+      setTestBusy(false);
     }
   }
 
@@ -248,35 +279,48 @@ export default function PushSettingsClient() {
           <div className="font-medium">Push notifications</div>
           <div className="text-sm opacity-70">Enable reminders and alerts on this device.</div>
         </div>
-        <div className="text-sm px-3 py-1 rounded-full border">{statusLabel}</div>
+
+        <div className="text-sm">
+          <span className="font-medium">{statusLabel}</span>
+        </div>
       </div>
 
-      {detail ? <div className="text-sm text-red-400">{detail}</div> : null}
+      {detail ? <div className="text-sm text-red-600">{detail}</div> : null}
 
       <div className="flex gap-2">
         <button
-          className="border rounded px-3 py-2 text-sm"
-          onClick={fetchStatusFromServer}
-          disabled={busy || status === "unsupported"}
-        >
-          Refresh status
-        </button>
-
-        <button
-          className="border rounded px-3 py-2 text-sm"
+          type="button"
           onClick={enablePush}
-          disabled={busy || status === "unsupported" || status === "denied"}
+          disabled={busy || status === "enabled" || status === "unsupported" || status === "denied"}
+          className="rounded-lg border px-3 py-2 text-sm hover:bg-muted disabled:opacity-50"
         >
-          Enable
+          {busy ? "Working…" : "Enable"}
         </button>
 
         <button
-          className="border rounded px-3 py-2 text-sm"
+          type="button"
           onClick={disablePush}
-          disabled={busy || status === "unsupported"}
+          disabled={busy || status !== "enabled"}
+          className="rounded-lg border px-3 py-2 text-sm hover:bg-muted disabled:opacity-50"
         >
-          Disable
+          {busy ? "Working…" : "Disable"}
         </button>
+
+        <button
+          type="button"
+          onClick={sendTestPush}
+          disabled={testBusy || status !== "enabled"}
+          className="rounded-lg border px-3 py-2 text-sm hover:bg-muted disabled:opacity-50"
+          title={status !== "enabled" ? "Enable push first" : "Send a test push to this device"}
+        >
+          {testBusy ? "Sending…" : "Send test"}
+        </button>
+      </div>
+
+      {testResult ? <div className="text-sm opacity-80">{testResult}</div> : null}
+
+      <div className="text-xs opacity-60">
+        Tip: On iPhone, test pushes are easiest to see when the phone is locked or the app is in the background.
       </div>
     </div>
   );
