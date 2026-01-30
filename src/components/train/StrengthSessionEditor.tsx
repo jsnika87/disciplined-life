@@ -1,231 +1,275 @@
-// src/components/train/StrengthSessionEditor.tsx
 "use client";
 
-import { useEffect, useState } from "react";
-import type { TrainExercise, TrainSet } from "@/lib/trainV2";
+import { useEffect, useMemo, useState } from "react";
+import type { TrainSession } from "@/lib/trainV2";
 import {
   listExercises,
-  createExercise,
-  updateExercise,
+  addExercise,
   deleteExercise,
   listSets,
-  createSet,
+  addSet,
   updateSet,
   deleteSet,
 } from "@/lib/trainV2DetailsData";
 
-type Props = {
-  sessionId: string;
-};
+type ExRow = { id: string; name: string; notes: string | null; sort_order: number };
+type SetRow = { id: string; reps: number | null; weight_lbs: number | null; notes: string | null; sort_order: number };
 
-type ExerciseWithSets = TrainExercise & { sets: TrainSet[]; loadingSets?: boolean };
+export default function StrengthSessionEditor(props: {
+  session: TrainSession;
+  onSaveSession: (patch: Partial<Pick<TrainSession, "title" | "notes" | "duration_sec">>) => Promise<void>;
+  onSaved: () => void;
+}) {
+  const s = props.session;
 
-export default function StrengthSessionEditor({ sessionId }: Props) {
+  const [title, setTitle] = useState(s.title ?? "");
+  const [notes, setNotes] = useState(s.notes ?? "");
+  const [durationMin, setDurationMin] = useState(s.duration_sec != null ? String(Math.round(s.duration_sec / 60)) : "");
+
   const [loading, setLoading] = useState(true);
-  const [savingErr, setSavingErr] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
 
-  const [exName, setExName] = useState("");
-  const [exercises, setExercises] = useState<ExerciseWithSets[]>([]);
-
-  async function load() {
-    setLoading(true);
-    setSavingErr(null);
-    try {
-      const ex = await listExercises(sessionId);
-
-      // load sets for each exercise
-      const withSets: ExerciseWithSets[] = await Promise.all(
-        ex.map(async (e) => {
-          const sets = await listSets(e.id);
-          return { ...e, sets };
-        })
-      );
-
-      setExercises(withSets);
-    } catch (e: any) {
-      setSavingErr(e?.message ?? String(e));
-    } finally {
-      setLoading(false);
-    }
-  }
+  const [exercises, setExercises] = useState<ExRow[]>([]);
+  const [setsByExercise, setSetsByExercise] = useState<Record<string, SetRow[]>>({});
+  const [newExerciseName, setNewExerciseName] = useState("");
 
   useEffect(() => {
-    void load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId]);
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      setErr(null);
+      try {
+        const ex = await listExercises(s.id);
+        if (cancelled) return;
+        setExercises(ex);
 
-  async function addExercise() {
-    const name = exName.trim();
+        const map: Record<string, SetRow[]> = {};
+        for (const e of ex) {
+          map[e.id] = await listSets(e.id);
+        }
+        if (cancelled) return;
+        setSetsByExercise(map);
+      } catch (e: any) {
+        if (!cancelled) setErr(e?.message ?? String(e));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [s.id]);
+
+  const totalSets = useMemo(() => {
+    return Object.values(setsByExercise).reduce((acc, arr) => acc + (arr?.length ?? 0), 0);
+  }, [setsByExercise]);
+
+  async function saveTop() {
+    setErr(null);
+    try {
+      const min = durationMin.trim() === "" ? null : Number(durationMin);
+      if (min != null && (!Number.isFinite(min) || min < 0)) throw new Error("Duration must be a positive number.");
+
+      await props.onSaveSession({
+        title: title.trim() === "" ? null : title,
+        notes: notes.trim() === "" ? null : notes,
+        duration_sec: min == null ? null : Math.max(0, Math.round(min * 60)),
+      });
+    } catch (e: any) {
+      setErr(e?.message ?? String(e));
+    }
+  }
+
+  async function onAddExercise() {
+    setErr(null);
+    const name = newExerciseName.trim();
     if (!name) return;
 
-    setSavingErr(null);
     try {
-      const created = await createExercise(sessionId, name, exercises.length);
-      setExercises((prev) => [...prev, { ...created, sets: [] }]);
-      setExName("");
+      const created = await addExercise(s.id, name);
+      setExercises((prev) => [...prev, created]);
+      setSetsByExercise((prev) => ({ ...prev, [created.id]: [] }));
+      setNewExerciseName("");
     } catch (e: any) {
-      setSavingErr(e?.message ?? String(e));
+      setErr(e?.message ?? String(e));
     }
   }
 
-  async function renameExercise(exId: string, name: string) {
-    setSavingErr(null);
+  async function onDeleteExercise(exerciseId: string) {
+    setErr(null);
     try {
-      await updateExercise(exId, { name });
-      setExercises((prev) => prev.map((e) => (e.id === exId ? { ...e, name } : e)));
+      await deleteExercise(exerciseId);
+      setExercises((prev) => prev.filter((x) => x.id !== exerciseId));
+      setSetsByExercise((prev) => {
+        const next = { ...prev };
+        delete next[exerciseId];
+        return next;
+      });
     } catch (e: any) {
-      setSavingErr(e?.message ?? String(e));
+      setErr(e?.message ?? String(e));
     }
   }
 
-  async function removeExercise(exId: string) {
-    setSavingErr(null);
+  async function onAddSet(exerciseId: string) {
+    setErr(null);
     try {
-      await deleteExercise(exId);
-      setExercises((prev) => prev.filter((e) => e.id !== exId));
+      const created = await addSet(exerciseId);
+      setSetsByExercise((prev) => ({ ...prev, [exerciseId]: [...(prev[exerciseId] ?? []), created] }));
     } catch (e: any) {
-      setSavingErr(e?.message ?? String(e));
+      setErr(e?.message ?? String(e));
     }
   }
 
-  async function addSet(exId: string) {
-    setSavingErr(null);
-    try {
-      const ex = exercises.find((x) => x.id === exId);
-      const nextIndex = (ex?.sets?.length ?? 0) + 1;
-
-      const created = await createSet(exId, nextIndex);
-      setExercises((prev) =>
-        prev.map((e) => (e.id === exId ? { ...e, sets: [...e.sets, created] } : e))
-      );
-    } catch (e: any) {
-      setSavingErr(e?.message ?? String(e));
-    }
-  }
-
-  async function patchSet(setId: string, exId: string, patch: Partial<Pick<TrainSet, "reps" | "weight_lbs" | "notes">>) {
-    setSavingErr(null);
+  async function onUpdateSet(exerciseId: string, setId: string, patch: Partial<Pick<SetRow, "reps" | "weight_lbs" | "notes">>) {
+    setErr(null);
     try {
       await updateSet(setId, patch);
-      setExercises((prev) =>
-        prev.map((e) =>
-          e.id !== exId ? e : { ...e, sets: e.sets.map((s) => (s.id === setId ? { ...s, ...patch } : s)) }
-        )
-      );
+      setSetsByExercise((prev) => ({
+        ...prev,
+        [exerciseId]: (prev[exerciseId] ?? []).map((r) => (r.id === setId ? { ...r, ...patch } : r)),
+      }));
     } catch (e: any) {
-      setSavingErr(e?.message ?? String(e));
+      setErr(e?.message ?? String(e));
     }
   }
 
-  async function removeSet(setId: string, exId: string) {
-    setSavingErr(null);
+  async function onDeleteSet(exerciseId: string, setId: string) {
+    setErr(null);
     try {
       await deleteSet(setId);
-      setExercises((prev) =>
-        prev.map((e) => (e.id === exId ? { ...e, sets: e.sets.filter((s) => s.id !== setId) } : e))
-      );
+      setSetsByExercise((prev) => ({ ...prev, [exerciseId]: (prev[exerciseId] ?? []).filter((r) => r.id !== setId) }));
     } catch (e: any) {
-      setSavingErr(e?.message ?? String(e));
+      setErr(e?.message ?? String(e));
     }
+  }
+
+  async function saveAndClose() {
+    await saveTop();
+    props.onSaved();
   }
 
   if (loading) return <div className="text-sm opacity-70">Loading workout details…</div>;
 
   return (
-    <div className="space-y-3">
-      {savingErr ? <div className="rounded-lg border p-2 text-sm text-red-600">Error: {savingErr}</div> : null}
+    <div className="space-y-4">
+      {err ? <div className="rounded-lg border p-2 text-sm text-red-600">Error: {err}</div> : null}
 
-      <div className="flex gap-2">
-        <input
-          className="flex-1 rounded-lg border px-3 py-2 text-sm"
-          value={exName}
-          onChange={(e) => setExName(e.target.value)}
-          placeholder="Add exercise (e.g., Bench Press)"
-        />
-        <button className="rounded-lg border px-3 py-2 text-sm hover:bg-muted" type="button" onClick={addExercise}>
-          Add
-        </button>
+      <div className="grid gap-3">
+        <label className="space-y-1 block">
+          <div className="text-xs opacity-70">Title</div>
+          <input className="w-full rounded-lg border px-3 py-2 text-sm" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Evening workout" />
+        </label>
+
+        <label className="space-y-1 block">
+          <div className="text-xs opacity-70">Duration (minutes)</div>
+          <input className="w-full rounded-lg border px-3 py-2 text-sm" value={durationMin} onChange={(e) => setDurationMin(e.target.value)} inputMode="numeric" placeholder="45" />
+        </label>
+
+        <label className="space-y-1 block">
+          <div className="text-xs opacity-70">Notes</div>
+          <textarea className="w-full rounded-lg border px-3 py-2 text-sm" value={notes} onChange={(e) => setNotes(e.target.value)} rows={2} placeholder="Optional notes…" />
+        </label>
+
+        <div className="text-xs opacity-70">Exercises: {exercises.length} • Sets: {totalSets}</div>
       </div>
 
-      {exercises.length === 0 ? (
-        <div className="text-sm opacity-70">No exercises yet.</div>
-      ) : (
-        <div className="space-y-3">
-          {exercises.map((ex) => (
-            <div key={ex.id} className="rounded-xl border p-3 space-y-2">
-              <div className="flex items-center justify-between gap-2">
-                <input
-                  className="w-full rounded-lg border px-3 py-2 text-sm"
-                  value={ex.name}
-                  onChange={(e) => renameExercise(ex.id, e.target.value)}
-                />
-                <button
-                  className="rounded-lg border px-2 py-2 text-xs hover:bg-muted"
-                  type="button"
-                  onClick={() => removeExercise(ex.id)}
-                  title="Delete exercise"
-                >
-                  ✕
-                </button>
-              </div>
+      <div className="rounded-xl border p-3 space-y-3">
+        <div className="font-semibold">Exercises</div>
 
-              <div className="space-y-2">
-                {ex.sets.length === 0 ? (
-                  <div className="text-xs opacity-70">No sets yet.</div>
-                ) : (
-                  ex.sets.map((s) => (
-                    <div key={s.id} className="grid grid-cols-12 gap-2 items-center">
-                      <div className="col-span-2 text-xs opacity-70">Set {s.set_index}</div>
+        <div className="flex gap-2">
+          <input
+            className="flex-1 rounded-lg border px-3 py-2 text-sm"
+            value={newExerciseName}
+            onChange={(e) => setNewExerciseName(e.target.value)}
+            placeholder="Add exercise (e.g., Bench Press)"
+          />
+          <button className="rounded-lg border px-3 py-2 text-sm hover:bg-muted" type="button" onClick={onAddExercise}>
+            Add
+          </button>
+        </div>
 
-                      <input
-                        className="col-span-3 rounded-lg border px-2 py-2 text-sm"
-                        inputMode="numeric"
-                        placeholder="Reps"
-                        value={s.reps ?? ""}
-                        onChange={(e) => {
-                          const v = e.target.value.trim();
-                          patchSet(s.id, ex.id, { reps: v === "" ? null : Number(v) });
-                        }}
-                      />
+        {exercises.length === 0 ? (
+          <div className="text-sm opacity-70">No exercises yet. Add one above.</div>
+        ) : (
+          <div className="space-y-3">
+            {exercises.map((ex) => (
+              <div key={ex.id} className="rounded-xl border p-3 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="font-semibold">{ex.name}</div>
+                  <button className="rounded-lg border px-2 py-1 text-xs hover:bg-muted" type="button" onClick={() => onDeleteExercise(ex.id)}>
+                    Delete
+                  </button>
+                </div>
 
-                      <input
-                        className="col-span-3 rounded-lg border px-2 py-2 text-sm"
-                        inputMode="decimal"
-                        placeholder="Weight"
-                        value={s.weight_lbs ?? ""}
-                        onChange={(e) => {
-                          const v = e.target.value.trim();
-                          patchSet(s.id, ex.id, { weight_lbs: v === "" ? null : Number(v) });
-                        }}
-                      />
+                <div className="space-y-2">
+                  {(setsByExercise[ex.id] ?? []).map((st) => (
+                    <div key={st.id} className="rounded-lg border p-2 space-y-2">
+                      <div className="grid grid-cols-2 gap-2">
+                        <label className="space-y-1">
+                          <div className="text-xs opacity-70">Reps</div>
+                          <input
+                            className="w-full rounded-lg border px-3 py-2 text-sm"
+                            inputMode="numeric"
+                            value={st.reps != null ? String(st.reps) : ""}
+                            onChange={(e) => {
+                              const v = e.target.value.trim();
+                              const reps = v === "" ? null : Number(v);
+                              onUpdateSet(ex.id, st.id, { reps: reps == null ? null : Math.max(0, Math.round(reps)) });
+                            }}
+                            placeholder="10"
+                          />
+                        </label>
 
-                      <input
-                        className="col-span-3 rounded-lg border px-2 py-2 text-sm"
-                        placeholder="Notes"
-                        value={s.notes ?? ""}
-                        onChange={(e) => patchSet(s.id, ex.id, { notes: e.target.value })}
-                      />
+                        <label className="space-y-1">
+                          <div className="text-xs opacity-70">Weight (lbs)</div>
+                          <input
+                            className="w-full rounded-lg border px-3 py-2 text-sm"
+                            inputMode="decimal"
+                            value={st.weight_lbs != null ? String(st.weight_lbs) : ""}
+                            onChange={(e) => {
+                              const v = e.target.value.trim();
+                              const w = v === "" ? null : Number(v);
+                              onUpdateSet(ex.id, st.id, { weight_lbs: w == null ? null : w });
+                            }}
+                            placeholder="135"
+                          />
+                        </label>
+                      </div>
 
-                      <button
-                        className="col-span-1 rounded-lg border px-2 py-2 text-xs hover:bg-muted"
-                        type="button"
-                        onClick={() => removeSet(s.id, ex.id)}
-                        title="Delete set"
-                      >
-                        🗑️
+                      <label className="space-y-1 block">
+                        <div className="text-xs opacity-70">Notes</div>
+                        <input
+                          className="w-full rounded-lg border px-3 py-2 text-sm"
+                          value={st.notes ?? ""}
+                          onChange={(e) => onUpdateSet(ex.id, st.id, { notes: e.target.value })}
+                          placeholder="Optional (RPE, tempo, etc.)"
+                        />
+                      </label>
+
+                      <button className="rounded-lg border px-2 py-1 text-xs hover:bg-muted" type="button" onClick={() => onDeleteSet(ex.id, st.id)}>
+                        Remove set
                       </button>
                     </div>
-                  ))
-                )}
+                  ))}
+                </div>
 
-                <button className="rounded-lg border px-3 py-2 text-sm hover:bg-muted" type="button" onClick={() => addSet(ex.id)}>
+                <button className="rounded-lg border px-3 py-2 text-sm hover:bg-muted" type="button" onClick={() => onAddSet(ex.id)}>
                   + Add set
                 </button>
               </div>
-            </div>
-          ))}
-        </div>
-      )}
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="flex gap-2">
+        <button className="rounded-lg border px-3 py-2 text-sm hover:bg-muted" type="button" onClick={saveAndClose}>
+          Save & close
+        </button>
+        <button className="rounded-lg border px-3 py-2 text-sm hover:bg-muted" type="button" onClick={props.onSaved}>
+          Cancel
+        </button>
+      </div>
     </div>
   );
 }

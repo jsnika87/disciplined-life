@@ -1,4 +1,3 @@
-// src/components/train/TimerPanel.tsx
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -6,238 +5,326 @@ import { useEffect, useMemo, useRef, useState } from "react";
 type TimerMode = "idle" | "running" | "paused";
 type TimerKind = "countdown" | "stopwatch";
 
-type TimerState = {
-  mode: TimerMode;
+export type TimerState = {
   kind: TimerKind;
+  mode: TimerMode;
+  durationMs: number; // for countdown
   startedAtMs: number | null;
   pausedAtMs: number | null;
-  durationMs: number; // countdown target; 0 for stopwatch
-  elapsedMs: number; // accumulated elapsed time
+  elapsedMs: number; // cached for display
 };
 
-const LS_KEY = "dl:train:timer:v2";
+type SessionPick = { id: string; label: string };
+
+const LS_STATE = "dl:trainTimerState:v1";
+const LS_ATTACH = "dl:trainTimerAttachSessionId:v1";
+
+function clamp(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function fmt(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${String(m).padStart(1, "0")}:${String(s).padStart(2, "0")}`;
+}
 
 function nowMs() {
   return Date.now();
 }
 
-function formatMs(ms: number) {
-  const totalSec = Math.max(0, Math.floor(ms / 1000));
-  const h = Math.floor(totalSec / 3600);
-  const m = Math.floor((totalSec % 3600) / 60);
-  const s = totalSec % 60;
-  if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
-  return `${m}:${String(s).padStart(2, "0")}`;
+function makeDefault(): TimerState {
+  return {
+    kind: "countdown",
+    mode: "idle",
+    durationMs: 10 * 60 * 1000,
+    startedAtMs: null,
+    pausedAtMs: null,
+    elapsedMs: 0,
+  };
 }
 
-const DEFAULT_STATE: TimerState = {
-  mode: "idle",
-  kind: "countdown",
-  startedAtMs: null,
-  pausedAtMs: null,
-  durationMs: 10 * 60 * 1000,
-  elapsedMs: 0,
-};
+export default function TimerPanel(props: {
+  sessions?: SessionPick[];
+  onApplyDurationSec?: (sessionId: string, durationSec: number) => Promise<void> | void;
+}) {
+  const sessions = props.sessions ?? [];
+  const onApply = props.onApplyDurationSec;
 
-function loadState(): TimerState {
-  try {
-    const raw = localStorage.getItem(LS_KEY);
-    if (!raw) return DEFAULT_STATE;
+  const [state, setState] = useState<TimerState>(() => makeDefault());
+  const [attachedSessionId, setAttachedSessionId] = useState<string>("");
 
-    const parsed = JSON.parse(raw) as TimerState;
+  const tickRef = useRef<number | null>(null);
 
-    // Basic shape validation
-    if (
-      !parsed ||
-      (parsed.mode !== "idle" && parsed.mode !== "running" && parsed.mode !== "paused") ||
-      (parsed.kind !== "countdown" && parsed.kind !== "stopwatch")
-    ) {
-      return DEFAULT_STATE;
-    }
-
-    return parsed;
-  } catch {
-    return DEFAULT_STATE;
-  }
-}
-
-function saveState(s: TimerState) {
-  localStorage.setItem(LS_KEY, JSON.stringify(s));
-}
-
-export default function TimerPanel() {
-  const [state, setState] = useState<TimerState>(DEFAULT_STATE);
-  const [, forceTick] = useState(0);
-  const intervalRef = useRef<number | null>(null);
-
-  // Load from storage on mount
+  // restore state
   useEffect(() => {
-    setState(loadState());
+    try {
+      const raw = localStorage.getItem(LS_STATE);
+      if (raw) {
+        const parsed = JSON.parse(raw) as Partial<TimerState>;
+        setState((prev) => ({
+          ...prev,
+          kind: parsed.kind ?? prev.kind,
+          mode: parsed.mode ?? prev.mode,
+          durationMs: typeof parsed.durationMs === "number" ? parsed.durationMs : prev.durationMs,
+          startedAtMs: typeof parsed.startedAtMs === "number" ? parsed.startedAtMs : null,
+          pausedAtMs: typeof parsed.pausedAtMs === "number" ? parsed.pausedAtMs : null,
+          elapsedMs: typeof parsed.elapsedMs === "number" ? parsed.elapsedMs : 0,
+        }));
+      }
+
+      const a = localStorage.getItem(LS_ATTACH);
+      if (a) setAttachedSessionId(a);
+    } catch {
+      // ignore
+    }
   }, []);
 
-  // Tick while running
+  // persist state
   useEffect(() => {
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current);
-      intervalRef.current = null;
+    try {
+      localStorage.setItem(LS_STATE, JSON.stringify(state));
+    } catch {
+      // ignore
     }
-
-    if (state.mode === "running") {
-      intervalRef.current = window.setInterval(() => {
-        forceTick((t) => t + 1);
-      }, 1000);
-    }
-
-    return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-    };
-  }, [state.mode]);
-
-  const computed = useMemo(() => {
-    const now = nowMs();
-
-    const elapsed =
-      state.mode === "running" && state.startedAtMs
-        ? state.elapsedMs + (now - state.startedAtMs)
-        : state.elapsedMs;
-
-    if (state.kind === "stopwatch") {
-      return { label: formatMs(elapsed), done: false };
-    }
-
-    const remaining = Math.max(0, state.durationMs - elapsed);
-    return {
-      label: formatMs(remaining),
-      done: remaining === 0 && state.mode !== "idle",
-    };
   }, [state]);
 
-  // Auto-finish countdown
   useEffect(() => {
-    if (state.kind !== "countdown") return;
-    if (!computed.done) return;
-
-    const finished: TimerState = {
-      ...state,
-      mode: "idle",
-      startedAtMs: null,
-      pausedAtMs: null,
-      elapsedMs: 0,
-    };
-
-    setState(finished);
-    saveState(finished);
-
     try {
-      alert("Timer finished ✅");
+      if (attachedSessionId) localStorage.setItem(LS_ATTACH, attachedSessionId);
+      else localStorage.removeItem(LS_ATTACH);
     } catch {
-      /* ignore */
+      // ignore
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [computed.done]);
+  }, [attachedSessionId]);
 
-  function commit(next: TimerState) {
-    setState(next);
-    saveState(next);
+  function computeElapsedMs(s: TimerState): number {
+    if (s.mode === "idle") return 0;
+
+    if (s.kind === "stopwatch") {
+      if (!s.startedAtMs) return s.elapsedMs ?? 0;
+
+      if (s.mode === "paused") {
+        // pausedAtMs marks pause moment; elapsedMs already cached
+        return s.elapsedMs ?? 0;
+      }
+
+      return clamp((nowMs() - s.startedAtMs) + (s.elapsedMs ?? 0), 0, 1000 * 60 * 60 * 24);
+    }
+
+    // countdown
+    if (!s.startedAtMs) return s.durationMs;
+
+    if (s.mode === "paused") {
+      const remaining = s.durationMs - (s.elapsedMs ?? 0);
+      return clamp(remaining, 0, s.durationMs);
+    }
+
+    const runElapsed = nowMs() - s.startedAtMs;
+    const remaining = s.durationMs - (runElapsed + (s.elapsedMs ?? 0));
+    return clamp(remaining, 0, s.durationMs);
   }
 
+  // tick loop
+  useEffect(() => {
+    if (tickRef.current) window.clearInterval(tickRef.current);
+    tickRef.current = window.setInterval(() => {
+      setState((prev) => {
+        if (prev.mode !== "running") return prev;
+        const valueMs = computeElapsedMs(prev);
+
+        // auto-stop countdown at 0
+        if (prev.kind === "countdown" && valueMs <= 0) {
+          return {
+            ...prev,
+            mode: "idle",
+            startedAtMs: null,
+            pausedAtMs: null,
+            elapsedMs: prev.elapsedMs ?? 0,
+          };
+        }
+
+        return { ...prev };
+      });
+    }, 250);
+
+    return () => {
+      if (tickRef.current) window.clearInterval(tickRef.current);
+      tickRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const displayMs = useMemo(() => computeElapsedMs(state), [state]);
+
   function start() {
-    if (state.mode === "running") return;
-    commit({
-      ...state,
-      mode: "running",
-      startedAtMs: nowMs(),
-      pausedAtMs: null,
+    setState((prev) => {
+      if (prev.mode === "running") return prev;
+
+      if (prev.kind === "stopwatch") {
+        return {
+          ...prev,
+          mode: "running",
+          startedAtMs: nowMs(),
+          pausedAtMs: null,
+        };
+      }
+
+      // countdown
+      return {
+        ...prev,
+        mode: "running",
+        startedAtMs: nowMs(),
+        pausedAtMs: null,
+      };
     });
   }
 
   function pause() {
-    if (state.mode !== "running" || !state.startedAtMs) return;
+    setState((prev) => {
+      if (prev.mode !== "running") return prev;
 
-    const elapsedNow = state.elapsedMs + (nowMs() - state.startedAtMs);
+      if (prev.kind === "stopwatch") {
+        const runElapsed = prev.startedAtMs ? (nowMs() - prev.startedAtMs) : 0;
+        return {
+          ...prev,
+          mode: "paused",
+          pausedAtMs: nowMs(),
+          startedAtMs: null,
+          elapsedMs: (prev.elapsedMs ?? 0) + runElapsed,
+        };
+      }
 
-    commit({
-      ...state,
-      mode: "paused",
-      startedAtMs: null,
-      pausedAtMs: nowMs(),
-      elapsedMs: elapsedNow,
+      // countdown: cache elapsed for later
+      const runElapsed = prev.startedAtMs ? (nowMs() - prev.startedAtMs) : 0;
+      return {
+        ...prev,
+        mode: "paused",
+        pausedAtMs: nowMs(),
+        startedAtMs: null,
+        elapsedMs: (prev.elapsedMs ?? 0) + runElapsed,
+      };
     });
   }
 
   function reset() {
-    commit({
-      ...state,
+    setState((prev) => ({
+      ...prev,
       mode: "idle",
       startedAtMs: null,
       pausedAtMs: null,
       elapsedMs: 0,
-    });
+    }));
   }
 
   function setCountdownMinutes(min: number) {
-    commit({
-      mode: "idle",
+    const ms = clamp(Math.round(min * 60 * 1000), 60 * 1000, 60 * 60 * 1000);
+    setState((prev) => ({
+      ...prev,
       kind: "countdown",
+      mode: "idle",
+      durationMs: ms,
       startedAtMs: null,
       pausedAtMs: null,
       elapsedMs: 0,
-      durationMs: Math.max(1, Math.round(min)) * 60 * 1000,
-    });
+    }));
   }
 
   function setStopwatch() {
-    commit({
-      mode: "idle",
+    setState((prev) => ({
+      ...prev,
       kind: "stopwatch",
+      mode: "idle",
       startedAtMs: null,
       pausedAtMs: null,
       elapsedMs: 0,
-      durationMs: 0,
-    });
+    }));
+  }
+
+  async function applyDurationToSession() {
+    if (!onApply) return;
+    if (!attachedSessionId) return;
+
+    // for countdown, "duration" is configured duration - remaining
+    // for stopwatch, "duration" is elapsed
+    const sec =
+      state.kind === "stopwatch"
+        ? Math.max(0, Math.round(displayMs / 1000))
+        : Math.max(0, Math.round((state.durationMs - displayMs) / 1000));
+
+    if (sec <= 0) return;
+
+    await onApply(attachedSessionId, sec);
   }
 
   return (
-    <div className="rounded-xl border p-4 space-y-3">
+    <section className="rounded-xl border p-4 space-y-3">
       <div className="flex items-center justify-between">
         <div className="font-semibold">Timers</div>
-        <div className="text-sm opacity-80">
-          {state.kind === "countdown" ? "Countdown" : "Stopwatch"}
-        </div>
+        <div className="text-sm opacity-70">{state.kind === "stopwatch" ? "Stopwatch" : "Countdown"}</div>
       </div>
 
-      <div className="text-3xl font-semibold tabular-nums">{computed.label}</div>
+      {sessions.length > 0 ? (
+        <label className="block space-y-1">
+          <div className="text-xs opacity-70">Attach timer to session (optional)</div>
+          <select
+            className="w-full rounded-lg border px-3 py-2 text-sm bg-background"
+            value={attachedSessionId}
+            onChange={(e) => setAttachedSessionId(e.target.value)}
+          >
+            <option value="">— Not attached —</option>
+            {sessions.map((s) => (
+              <option key={s.id} value={s.id}>
+                {s.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      ) : null}
+
+      <div className="text-5xl font-semibold tabular-nums">{fmt(displayMs)}</div>
 
       <div className="flex gap-2 flex-wrap">
-        <button className="rounded-lg border px-3 py-2 text-sm hover:bg-muted" onClick={start}>
+        <button className="rounded-lg border px-3 py-2 text-sm hover:bg-muted" type="button" onClick={start}>
           Start
         </button>
-        <button className="rounded-lg border px-3 py-2 text-sm hover:bg-muted" onClick={pause}>
+        <button className="rounded-lg border px-3 py-2 text-sm hover:bg-muted" type="button" onClick={pause}>
           Pause
         </button>
-        <button className="rounded-lg border px-3 py-2 text-sm hover:bg-muted" onClick={reset}>
+        <button className="rounded-lg border px-3 py-2 text-sm hover:bg-muted" type="button" onClick={reset}>
           Reset
         </button>
+
+        {onApply ? (
+          <button
+            className="rounded-lg border px-3 py-2 text-sm hover:bg-muted"
+            type="button"
+            onClick={applyDurationToSession}
+            disabled={!attachedSessionId}
+            title={!attachedSessionId ? "Choose a session to attach first" : "Apply the timer duration to the attached session"}
+          >
+            Apply to session
+          </button>
+        ) : null}
       </div>
 
       <div className="flex gap-2 flex-wrap">
-        <button className="rounded-lg border px-3 py-2 text-sm hover:bg-muted" onClick={() => setCountdownMinutes(5)}>
+        <button className="rounded-lg border px-3 py-2 text-sm hover:bg-muted" type="button" onClick={() => setCountdownMinutes(5)}>
           5m
         </button>
-        <button className="rounded-lg border px-3 py-2 text-sm hover:bg-muted" onClick={() => setCountdownMinutes(10)}>
+        <button className="rounded-lg border px-3 py-2 text-sm hover:bg-muted" type="button" onClick={() => setCountdownMinutes(10)}>
           10m
         </button>
-        <button className="rounded-lg border px-3 py-2 text-sm hover:bg-muted" onClick={() => setCountdownMinutes(20)}>
+        <button className="rounded-lg border px-3 py-2 text-sm hover:bg-muted" type="button" onClick={() => setCountdownMinutes(20)}>
           20m
         </button>
-        <button className="rounded-lg border px-3 py-2 text-sm hover:bg-muted" onClick={setStopwatch}>
+        <button className="rounded-lg border px-3 py-2 text-sm hover:bg-muted" type="button" onClick={setStopwatch}>
           Stopwatch
         </button>
       </div>
 
-      <div className="text-xs opacity-70">
-        iOS may pause timers in the background. State is restored when you return.
-      </div>
-    </div>
+      <div className="text-xs opacity-70">iOS may pause timers in the background. State is restored when you return.</div>
+    </section>
   );
 }

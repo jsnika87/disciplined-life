@@ -1,102 +1,184 @@
-// src/lib/trainV2DetailsData.ts
-
 import { supabase } from "@/lib/supabaseClient";
-import type { TrainExercise, TrainSet, TrainWalkDetails } from "@/lib/trainV2";
 
-export async function listExercises(sessionId: string): Promise<TrainExercise[]> {
+async function requireUserId(): Promise<string> {
+  const { data } = await supabase.auth.getUser();
+  const uid = data.user?.id;
+  if (!uid) throw new Error("Not logged in.");
+  return uid;
+}
+
+/** ---------------------------
+ * Walk details
+ * --------------------------*/
+
+export type WalkDetails = {
+  id: string;
+  user_id: string;
+  session_id: string;
+  steps: number | null;
+  distance_mi: number | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export async function getOrCreateWalkDetails(sessionId: string): Promise<WalkDetails> {
+  const uid = await requireUserId();
+
+  const existing = await supabase
+    .schema("disciplined")
+    .from("train_walk_details")
+    .select("*")
+    .eq("session_id", sessionId)
+    .maybeSingle<WalkDetails>();
+
+  if (existing.error) throw existing.error;
+  if (existing.data) return existing.data;
+
+  const created = await supabase
+    .schema("disciplined")
+    .from("train_walk_details")
+    .insert({ user_id: uid, session_id: sessionId, steps: null, distance_mi: null })
+    .select("*")
+    .single<WalkDetails>();
+
+  if (created.error) throw created.error;
+  return created.data;
+}
+
+export async function updateWalkDetails(sessionId: string, patch: { steps?: number | null; distance_mi?: number | null }) {
+  const uid = await requireUserId();
+
+  const upd = await supabase
+    .schema("disciplined")
+    .from("train_walk_details")
+    .update({ ...patch })
+    .eq("session_id", sessionId)
+    .eq("user_id", uid);
+
+  if (upd.error) throw upd.error;
+}
+
+/** ---------------------------
+ * Strength: exercises + sets
+ * --------------------------*/
+
+export type TrainExerciseRow = {
+  id: string;
+  user_id: string;
+  session_id: string;
+  name: string;
+  sort_order: number;
+  notes: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type TrainSetRow = {
+  id: string;
+  user_id: string;
+  exercise_id: string;
+  sort_order: number;
+  reps: number | null;
+  weight_lbs: number | null;
+  notes: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export async function listExercises(sessionId: string): Promise<TrainExerciseRow[]> {
+  const uid = await requireUserId();
   const res = await supabase
     .schema("disciplined")
     .from("train_exercises")
     .select("*")
     .eq("session_id", sessionId)
-    .order("sort_order", { ascending: true })
-    .order("created_at", { ascending: true });
+    .eq("user_id", uid)
+    .order("sort_order", { ascending: true });
 
   if (res.error) throw res.error;
-  return (res.data ?? []) as TrainExercise[];
+  return res.data ?? [];
 }
 
-export async function createExercise(sessionId: string, name: string, sort_order = 0): Promise<TrainExercise> {
+export async function addExercise(sessionId: string, name: string): Promise<TrainExerciseRow> {
+  const uid = await requireUserId();
+
+  const current = await listExercises(sessionId);
+  const sort_order = current.length;
+
+  const created = await supabase
+    .schema("disciplined")
+    .from("train_exercises")
+    .insert({ user_id: uid, session_id: sessionId, name, sort_order })
+    .select("*")
+    .single<TrainExerciseRow>();
+
+  if (created.error) throw created.error;
+  return created.data;
+}
+
+export async function deleteExercise(exerciseId: string) {
+  const uid = await requireUserId();
   const res = await supabase
     .schema("disciplined")
     .from("train_exercises")
-    .insert({ session_id: sessionId, name, sort_order })
-    .select("*")
-    .single();
+    .delete()
+    .eq("id", exerciseId)
+    .eq("user_id", uid);
 
-  if (res.error) throw res.error;
-  return res.data as TrainExercise;
-}
-
-export async function updateExercise(id: string, patch: Partial<Pick<TrainExercise, "name" | "sort_order">>) {
-  const res = await supabase.schema("disciplined").from("train_exercises").update(patch).eq("id", id);
   if (res.error) throw res.error;
 }
 
-export async function deleteExercise(id: string) {
-  const res = await supabase.schema("disciplined").from("train_exercises").delete().eq("id", id);
-  if (res.error) throw res.error;
-}
-
-// ---- Sets ----
-
-export async function listSets(exerciseId: string): Promise<TrainSet[]> {
+export async function listSets(exerciseId: string): Promise<TrainSetRow[]> {
+  const uid = await requireUserId();
   const res = await supabase
     .schema("disciplined")
     .from("train_sets")
     .select("*")
     .eq("exercise_id", exerciseId)
-    .order("set_index", { ascending: true })
-    .order("created_at", { ascending: true });
+    .eq("user_id", uid)
+    .order("sort_order", { ascending: true });
 
   if (res.error) throw res.error;
-  return (res.data ?? []) as TrainSet[];
+  return res.data ?? [];
 }
 
-export async function createSet(exerciseId: string, set_index: number): Promise<TrainSet> {
+export async function addSet(exerciseId: string): Promise<TrainSetRow> {
+  const uid = await requireUserId();
+
+  const current = await listSets(exerciseId);
+  const sort_order = current.length;
+
+  const created = await supabase
+    .schema("disciplined")
+    .from("train_sets")
+    .insert({ user_id: uid, exercise_id: exerciseId, sort_order, reps: null, weight_lbs: null, notes: null })
+    .select("*")
+    .single<TrainSetRow>();
+
+  if (created.error) throw created.error;
+  return created.data;
+}
+
+export async function updateSet(setId: string, patch: Partial<Pick<TrainSetRow, "reps" | "weight_lbs" | "notes">>) {
+  const uid = await requireUserId();
   const res = await supabase
     .schema("disciplined")
     .from("train_sets")
-    .insert({ exercise_id: exerciseId, set_index })
-    .select("*")
-    .single();
+    .update({ ...patch })
+    .eq("id", setId)
+    .eq("user_id", uid);
 
-  if (res.error) throw res.error;
-  return res.data as TrainSet;
-}
-
-export async function updateSet(
-  id: string,
-  patch: Partial<Pick<TrainSet, "set_index" | "reps" | "weight_lbs" | "notes">>
-) {
-  const res = await supabase.schema("disciplined").from("train_sets").update(patch).eq("id", id);
   if (res.error) throw res.error;
 }
 
-export async function deleteSet(id: string) {
-  const res = await supabase.schema("disciplined").from("train_sets").delete().eq("id", id);
-  if (res.error) throw res.error;
-}
-
-// ---- Walk details ----
-
-export async function getWalkDetails(sessionId: string): Promise<TrainWalkDetails | null> {
+export async function deleteSet(setId: string) {
+  const uid = await requireUserId();
   const res = await supabase
     .schema("disciplined")
-    .from("train_walk_details")
-    .select("*")
-    .eq("session_id", sessionId)
-    .maybeSingle();
-
-  if (res.error) throw res.error;
-  return (res.data ?? null) as TrainWalkDetails | null;
-}
-
-export async function upsertWalkDetails(sessionId: string, patch: { distance_miles: number | null; steps: number | null }) {
-  const res = await supabase
-    .schema("disciplined")
-    .from("train_walk_details")
-    .upsert({ session_id: sessionId, ...patch }, { onConflict: "session_id" });
+    .from("train_sets")
+    .delete()
+    .eq("id", setId)
+    .eq("user_id", uid);
 
   if (res.error) throw res.error;
 }
