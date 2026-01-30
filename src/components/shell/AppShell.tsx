@@ -21,8 +21,25 @@ type NavItem = {
 };
 
 type StatusResponse =
-  | { ok: true; userId: string; role: "pending" | "user" | "admin"; approved: boolean; email?: string | null }
+  | {
+      ok: true;
+      userId: string;
+      role: "pending" | "user" | "admin";
+      approved: boolean;
+      email?: string | null;
+    }
   | { ok: false; reason: string; message?: string };
+
+async function fetchWithTimeout(input: RequestInfo, init: RequestInit, ms: number) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), ms);
+  try {
+    const res = await fetch(input, { ...init, signal: controller.signal });
+    return res;
+  } finally {
+    clearTimeout(t);
+  }
+}
 
 export default function AppShell({ children }: { children: React.ReactNode }) {
   const router = useRouter();
@@ -31,6 +48,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   const [loading, setLoading] = useState(true);
   const [sessionUserId, setSessionUserId] = useState<string | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
+  const [loadHint, setLoadHint] = useState<string>("");
 
   // Prevent redirect storms (Safari)
   const redirectingRef = useRef(false);
@@ -60,29 +78,55 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   }
 
   async function fetchStatus(): Promise<StatusResponse> {
-    const res = await fetch("/api/profile/status", { method: "GET", cache: "no-store" });
-    if (res.status === 401) return { ok: false, reason: "not_authenticated" };
-    return (await res.json()) as StatusResponse;
+    try {
+      const res = await fetchWithTimeout(
+        "/api/profile/status",
+        { method: "GET", cache: "no-store" },
+        8000
+      );
+
+      if (res.status === 401) return { ok: false, reason: "not_authenticated" };
+
+      const data = (await res.json()) as StatusResponse;
+      return data;
+    } catch (e: any) {
+      if (e?.name === "AbortError") return { ok: false, reason: "timeout" };
+      return { ok: false, reason: "network_error", message: e?.message ?? String(e) };
+    }
   }
 
   async function evaluateAndRoute() {
-    const { data: sessionData } = await supabase.auth.getSession();
-    const session = sessionData.session;
+    setLoadHint("");
 
-    if (!session) {
+    // Session fetch can hang on iOS reloads; keep it bounded
+    let session: any = null;
+    try {
+      const sessionPromise = supabase.auth.getSession();
+      session = await Promise.race([
+        sessionPromise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 8000)),
+      ]);
+    } catch {
+      session = null;
+    }
+
+    const sessionData = session?.data?.session ?? null;
+
+    if (!sessionData) {
       setSessionUserId(null);
       setProfile(null);
       if (!isAuthRoute) safeReplace("/login");
       return;
     }
 
-    const userId = session.user.id;
+    const userId = sessionData.user.id;
     setSessionUserId(userId);
 
     const status = await fetchStatus();
 
     if (!status.ok) {
       // If we can’t confirm status, route to login (NOT pending)
+      setLoadHint(status.reason === "timeout" ? "Server check timed out" : "Could not verify session");
       if (!isAuthRoute) safeReplace("/login");
       setProfile(null);
       return;
@@ -90,7 +134,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
 
     const p: Profile = {
       id: status.userId,
-      email: status.email ?? session.user.email ?? null,
+      email: status.email ?? sessionData.user.email ?? null,
       display_name: null,
       role: status.role,
       approved: status.approved,
@@ -173,7 +217,19 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   }
 
   if (loading) {
-    return <div className="min-h-[60vh] flex items-center justify-center text-sm opacity-70">Loading…</div>;
+    return (
+      <div className="min-h-[60vh] flex flex-col items-center justify-center text-sm opacity-70 gap-3">
+        <div>Loading…</div>
+        {loadHint ? <div className="text-xs opacity-70">{loadHint}</div> : null}
+        <button
+          type="button"
+          onClick={() => router.replace("/login")}
+          className="rounded-lg border px-3 py-2 text-sm opacity-90"
+        >
+          Go to Login
+        </button>
+      </div>
+    );
   }
 
   if (!showChrome) return <>{children}</>;
@@ -186,7 +242,9 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
 
           <div className="flex items-center gap-3">
             {profile?.role ? (
-              <span className="text-sm opacity-80">{profile.role === "admin" ? "Admin" : "User"}</span>
+              <span className="text-sm opacity-80">
+                {profile.role === "admin" ? "Admin" : "User"}
+              </span>
             ) : null}
 
             <button
