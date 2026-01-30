@@ -1,9 +1,20 @@
 // src/app/(app)/train/TrainV2Client.tsx
 "use client";
 
+import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import TimerPanel from "@/components/train/TimerPanel";
-import { getOrCreateTrainDay, listSessions, createSession, updateSession, deleteSession, getBodyMetrics, upsertBodyMetrics } from "@/lib/trainV2Data";
+import StrengthSessionEditor from "@/components/train/StrengthSessionEditor";
+import WalkSessionEditor from "@/components/train/WalkSessionEditor";
+import {
+  getOrCreateTrainDay,
+  listSessions,
+  createSession,
+  updateSession,
+  deleteSession,
+  getBodyMetrics,
+  upsertBodyMetrics,
+} from "@/lib/trainV2Data";
 import type { TrainSession, TrainSessionType } from "@/lib/trainV2";
 
 function todayLocalISO(): string {
@@ -101,8 +112,13 @@ export default function TrainV2Client() {
     <div className="space-y-6">
       <div className="flex items-start justify-between gap-3">
         <div>
-          <div className="text-2xl font-semibold">Train</div>
-          <div className="text-sm opacity-70">Multiple sessions per day • Sets/Reps/Time • Timers • Weight/Waist</div>
+          <div className="flex items-center gap-3">
+            <div className="text-2xl font-semibold">Train</div>
+            <Link href="/train/history" className="rounded-lg border px-3 py-1.5 text-sm hover:bg-muted">
+              History
+            </Link>
+          </div>
+          <div className="text-sm opacity-70">Multiple sessions per day • Sets/Reps/Weight • Walk distance/steps • Timers • Weight/Waist</div>
         </div>
         <div className="text-sm opacity-70">Today: {localDate}</div>
       </div>
@@ -167,7 +183,7 @@ export default function TrainV2Client() {
         ) : (
           <div className="space-y-3">
             {sessions.map((s) => (
-              <div key={s.id} className="rounded-xl border p-3 space-y-2">
+              <div key={s.id} className="rounded-xl border p-3 space-y-3">
                 <div className="flex items-center justify-between gap-2">
                   <div className="text-sm opacity-70">
                     {s.session_type === "strength"
@@ -206,11 +222,17 @@ export default function TrainV2Client() {
                       placeholder="20"
                     />
                   </label>
-                ) : (
-                  <div className="text-xs opacity-70">
-                    Strength/walk details editor (exercises, sets, reps) comes next — we’re wiring the DB + page shell first.
-                  </div>
-                )}
+                ) : null}
+
+                {s.session_type === "walk" ? (
+                  <WalkSessionEditor
+                    sessionId={s.id}
+                    durationSec={s.duration_sec}
+                    onChangeDurationSec={(sec) => onUpdateSession(s.id, { duration_sec: sec })}
+                  />
+                ) : null}
+
+                {s.session_type === "strength" ? <StrengthSessionEditor sessionId={s.id} /> : null}
 
                 <textarea
                   className="w-full rounded-lg border px-3 py-2 text-sm"

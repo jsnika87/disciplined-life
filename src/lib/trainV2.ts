@@ -1,16 +1,18 @@
 // src/lib/trainV2.ts
-export type TrainSessionType = "strength" | "conditioning" | "walk" | "other";
+
+export type TrainSessionType = "walk" | "strength" | "conditioning";
 
 export type TrainDay = {
   id: string;
   user_id: string;
   local_date: string; // YYYY-MM-DD
+  created_at: string;
+  updated_at: string;
 };
 
 export type TrainSession = {
   id: string;
   day_id: string;
-  user_id: string;
   session_type: TrainSessionType;
   title: string | null;
   notes: string | null;
@@ -19,30 +21,40 @@ export type TrainSession = {
   updated_at: string;
 };
 
-export type TrainExercise = {
-  id: string;
-  session_id: string;
-  user_id: string;
-  name: string;
-  sort_order: number;
-};
-
-export type TrainSet = {
-  id: string;
-  exercise_id: string;
-  user_id: string;
-  set_index: number;
-  reps: number | null;
-  weight_lbs: number | null;
-  completed: boolean;
-};
-
-export type BodyMetrics = {
+export type TrainBodyMetrics = {
   id: string;
   user_id: string;
   local_date: string;
   weight_lbs: number | null;
   waist_in: number | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type TrainExercise = {
+  id: string;
+  session_id: string;
+  name: string;
+  sort_order: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type TrainSet = {
+  id: string;
+  exercise_id: string;
+  set_index: number;
+  reps: number | null;
+  weight_lbs: number | null;
   notes: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type TrainWalkDetails = {
+  session_id: string;
+  distance_miles: number | null;
+  steps: number | null;
+  created_at: string;
   updated_at: string;
 };
