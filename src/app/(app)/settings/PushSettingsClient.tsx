@@ -15,6 +15,29 @@ function urlBase64ToUint8Array(base64String: string) {
   return outputArray;
 }
 
+async function waitForController(timeoutMs = 5000) {
+  if (navigator.serviceWorker.controller) return true;
+
+  return await new Promise<boolean>((resolve) => {
+    const t = setTimeout(() => {
+      cleanup();
+      resolve(!!navigator.serviceWorker.controller);
+    }, timeoutMs);
+
+    function cleanup() {
+      clearTimeout(t);
+      navigator.serviceWorker.removeEventListener("controllerchange", onChange);
+    }
+
+    function onChange() {
+      cleanup();
+      resolve(true);
+    }
+
+    navigator.serviceWorker.addEventListener("controllerchange", onChange);
+  });
+}
+
 export default function PushSettingsClient() {
   const vapidPublicKey = process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY;
 
@@ -39,20 +62,19 @@ export default function PushSettingsClient() {
     const res = await fetch("/api/push/status", {
       method: "GET",
       headers: { Authorization: `Bearer ${token}` },
+      cache: "no-store",
     });
 
     const json = await res.json().catch(() => ({}));
-    if (json?.subscribed) setStatus("enabled");
-    else setStatus("disabled");
+    setStatus(json?.subscribed ? "enabled" : "disabled");
   }
 
-  // ✅ ensure the user has a settings row (runs once when this component mounts)
+  // ensure the user has a settings row (non-blocking)
   useEffect(() => {
     (async () => {
       try {
         await ensureUserSettings();
       } catch (e: any) {
-        // Don't block the rest of the page if this fails, but surface info
         console.error("ensureUserSettings failed:", e);
       }
     })();
@@ -96,32 +118,39 @@ export default function PushSettingsClient() {
 
     if (!standalone) {
       setStatus("error");
-      setDetail(
-        "On iPhone, push works only after installing to Home Screen. Install it, then reopen the app and try again."
-      );
-      return;
-    }
-
-    if (!navigator.serviceWorker.controller) {
-      setStatus("error");
-      setDetail(
-        "Service worker isn’t controlling yet. Close the app and reopen it, then try Enable again."
-      );
+      setDetail("On iPhone, push works only after installing to Home Screen. Install it, reopen, then try Enable.");
       return;
     }
 
     setBusy(true);
     setDetail("");
+
     try {
+      // Make sure SW is ready and up-to-date
+      const reg = await navigator.serviceWorker.ready;
+
+      // Ask browser to check for updated SW (helps after deploy)
+      try {
+        await reg.update();
+      } catch {
+        // ignore
+      }
+
+      // Ensure the page is controlled before subscribing (iOS requirement-ish)
+      const controlled = await waitForController(6000);
+      if (!controlled) {
+        setStatus("error");
+        setDetail("Service worker isn’t controlling yet. Close the PWA completely, reopen, then tap Enable again.");
+        return;
+      }
+
       const permission = await Notification.requestPermission();
       if (permission !== "granted") {
         setStatus(permission === "denied" ? "denied" : "disabled");
         return;
       }
 
-      const reg = await navigator.serviceWorker.ready;
       const existing = await reg.pushManager.getSubscription();
-
       const sub =
         existing ??
         (await reg.pushManager.subscribe({
@@ -154,10 +183,14 @@ export default function PushSettingsClient() {
 
       if (!res.ok) {
         const j = await res.json().catch(() => ({}));
-        throw new Error(j?.error ?? "Subscribe failed");
+        throw new Error(j?.error ?? j?.reason ?? "Subscribe failed");
       }
 
       setStatus("enabled");
+
+      // IMPORTANT: iOS PWA can enter mixed-version state after SW/push changes.
+      // One controlled reload prevents the “stuck Loading…” brick.
+      setTimeout(() => window.location.reload(), 250);
     } catch (e: any) {
       setStatus("error");
       setDetail(e?.message ?? "Unknown error");
@@ -171,6 +204,7 @@ export default function PushSettingsClient() {
 
     setBusy(true);
     setDetail("");
+
     try {
       const { data } = await supabase.auth.getSession();
       const token = data.session?.access_token;
@@ -184,15 +218,18 @@ export default function PushSettingsClient() {
 
       if (!res.ok) {
         const j = await res.json().catch(() => ({}));
-        throw new Error(j?.error ?? "Unsubscribe failed");
+        throw new Error(j?.error ?? j?.reason ?? "Unsubscribe failed");
       }
 
-      // optionally also remove browser subscription
+      // remove browser subscription too
       const reg = await navigator.serviceWorker.ready;
       const existing = await reg.pushManager.getSubscription();
       if (existing) await existing.unsubscribe();
 
       setStatus("disabled");
+
+      // Same reason: prevent iOS PWA mixed-state hang
+      setTimeout(() => window.location.reload(), 250);
     } catch (e: any) {
       setStatus("error");
       setDetail(e?.message ?? "Unknown error");
@@ -201,69 +238,54 @@ export default function PushSettingsClient() {
     }
   }
 
-  const pill = (() => {
-    const base = "inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium border";
-    switch (status) {
-      case "enabled":
-        return <span className={`${base} border-emerald-500/30 bg-emerald-500/10`}>Enabled</span>;
-      case "disabled":
-        return <span className={`${base} border-zinc-500/30 bg-zinc-500/10`}>Disabled</span>;
-      case "checking":
-        return <span className={`${base} border-zinc-500/30 bg-zinc-500/10`}>Checking…</span>;
-      case "unsupported":
-        return <span className={`${base} border-amber-500/30 bg-amber-500/10`}>Unsupported</span>;
-      case "denied":
-        return <span className={`${base} border-red-500/30 bg-red-500/10`}>Blocked</span>;
-      case "error":
-        return <span className={`${base} border-red-500/30 bg-red-500/10`}>Error</span>;
-    }
-  })();
+  const statusLabel =
+    status === "checking"
+      ? "Checking…"
+      : status === "enabled"
+        ? "Enabled"
+        : status === "disabled"
+          ? "Disabled"
+          : status === "unsupported"
+            ? "Unsupported"
+            : status === "denied"
+              ? "Denied"
+              : "Error";
 
   return (
-    <div className="border rounded-xl p-4 space-y-3">
-      <div className="flex items-start justify-between gap-3">
+    <div className="border rounded p-4 space-y-3">
+      <div className="flex items-center justify-between gap-3">
         <div>
-          <div className="font-semibold">Push notifications</div>
+          <div className="font-medium">Push notifications</div>
           <div className="text-sm opacity-70">Enable reminders and alerts on this device.</div>
         </div>
-        {pill}
+        <div className="text-sm px-3 py-1 rounded-full border">
+          {statusLabel}
+        </div>
       </div>
 
-      {status === "denied" && (
-        <div className="text-sm">
-          Notifications are blocked in your browser settings. Re-enable them for this site, then refresh.
-        </div>
-      )}
+      {detail ? <div className="text-sm text-red-400">{detail}</div> : null}
 
-      {status === "unsupported" && (
-        <div className="text-sm">Your browser/device doesn’t support push notifications for PWAs.</div>
-      )}
-
-      {status === "error" && detail && (
-        <div className="text-sm text-red-600 dark:text-red-400 break-words">{detail}</div>
-      )}
-
-      <div className="flex flex-wrap gap-2">
+      <div className="flex gap-2">
         <button
-          className="h-10 px-4 rounded-lg border hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-50"
+          className="border rounded px-3 py-2 text-sm"
           onClick={fetchStatusFromServer}
-          disabled={busy}
+          disabled={busy || status === "unsupported"}
         >
           Refresh status
         </button>
 
         <button
-          className="h-10 px-4 rounded-lg bg-black text-white dark:bg-white dark:text-black disabled:opacity-50"
+          className="border rounded px-3 py-2 text-sm"
           onClick={enablePush}
-          disabled={busy || status === "enabled" || status === "unsupported" || status === "denied"}
+          disabled={busy || status === "unsupported" || status === "denied"}
         >
           Enable
         </button>
 
         <button
-          className="h-10 px-4 rounded-lg border border-red-500/40 text-red-600 dark:text-red-400 hover:bg-red-500/10 disabled:opacity-50"
+          className="border rounded px-3 py-2 text-sm"
           onClick={disablePush}
-          disabled={busy || status !== "enabled"}
+          disabled={busy || status === "unsupported"}
         >
           Disable
         </button>

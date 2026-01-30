@@ -1,6 +1,7 @@
 // src/app/debug/page.tsx
 "use client";
 
+import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import { supabase } from "@/lib/supabaseClient";
 
@@ -15,18 +16,28 @@ export default function DebugPage() {
     const myRunId = ++runIdRef.current;
 
     const safeSetOut = (next: AnyObj) => {
-      // Prevent setting state if we've unmounted or a newer run started
       if (!isAlive) return;
       if (runIdRef.current !== myRunId) return;
       setOut(next);
     };
 
-    const withTimeout = async <T,>(fn: (signal: AbortSignal) => Promise<T>, ms: number) => {
+    const withTimeout = async <T,>(
+      fn: (signal: AbortSignal) => Promise<T>,
+      ms: number,
+      label: string
+    ): Promise<T> => {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), ms);
+      const timeout = setTimeout(() => controller.abort(label), ms);
 
       try {
         return await fn(controller.signal);
+      } catch (e: any) {
+        // Normalize timeout/abort errors
+        if (e?.name === "AbortError") {
+          const msg = typeof e?.message === "string" ? e.message : "aborted";
+          throw Object.assign(new Error(msg || `${label} aborted`), { name: "AbortError" });
+        }
+        throw e;
       } finally {
         clearTimeout(timeout);
       }
@@ -34,10 +45,15 @@ export default function DebugPage() {
 
     (async () => {
       const result: AnyObj = { loading: true };
+
       try {
         // --- Session ---
         try {
-          const session = await supabase.auth.getSession();
+          const session = await withTimeout(
+            async () => await supabase.auth.getSession(),
+            8000,
+            "supabase.auth.getSession timeout"
+          );
           result.sessionUser = session.data.session?.user ?? null;
           result.sessionError = session.error ?? null;
         } catch (e: any) {
@@ -48,12 +64,17 @@ export default function DebugPage() {
         // --- Profile ---
         if (result.sessionUser?.id) {
           try {
-            const prof = await supabase
-              .schema("disciplined")
-              .from("profiles")
-              .select("id,email,role,approved,timezone,updated_at")
-              .eq("id", result.sessionUser.id)
-              .single();
+            const prof = await withTimeout(
+              async () =>
+                await supabase
+                  .schema("disciplined")
+                  .from("profiles")
+                  .select("id,email,role,approved,timezone,updated_at")
+                  .eq("id", result.sessionUser.id)
+                  .single(),
+              8000,
+              "profiles select timeout"
+            );
 
             result.profile = prof.data ?? null;
             result.profileError = prof.error ?? null;
@@ -83,10 +104,15 @@ export default function DebugPage() {
           hasServiceWorkerController: !!navigator.serviceWorker?.controller,
         };
 
-        // service worker details
+        // --- service worker details (with timeouts) ---
         if ("serviceWorker" in navigator) {
           try {
-            const reg = await navigator.serviceWorker.getRegistration();
+            const reg = await withTimeout(
+              async () => await navigator.serviceWorker.getRegistration(),
+              5000,
+              "getRegistration timeout"
+            );
+
             result.serviceWorker = {
               scope: reg?.scope ?? null,
               activeScriptURL: (reg?.active && (reg.active as any).scriptURL) || null,
@@ -95,7 +121,12 @@ export default function DebugPage() {
             };
 
             if (reg && "pushManager" in reg) {
-              const sub = await reg.pushManager.getSubscription();
+              const sub = await withTimeout(
+                async () => await reg.pushManager.getSubscription(),
+                5000,
+                "getSubscription timeout"
+              );
+
               result.push.subscription = sub
                 ? {
                     endpoint: sub.endpoint,
@@ -110,18 +141,26 @@ export default function DebugPage() {
           result.serviceWorker = { supported: false };
         }
 
-        // --- Server push status (via app domain) ---
-        // IMPORTANT: If the page unmounts, we abort this fetch, but we do NOT mark it as an error.
+        // --- Server push status (AUTHORIZED like PushSettingsClient) ---
         try {
+          const { data } = await withTimeout(
+            async () => await supabase.auth.getSession(),
+            8000,
+            "getSession for push status timeout"
+          );
+          const token = data.session?.access_token ?? null;
+
           const statusJson = await withTimeout(async (signal) => {
             const res = await fetch("/api/push/status", {
               method: "GET",
               cache: "no-store",
-              headers: { "accept": "application/json" },
+              headers: {
+                accept: "application/json",
+                ...(token ? { Authorization: `Bearer ${token}` } : {}),
+              },
               signal,
             });
 
-            // If your endpoint returns non-200, capture it cleanly
             const text = await res.text();
             let parsed: any = null;
             try {
@@ -130,12 +169,11 @@ export default function DebugPage() {
               parsed = { raw: text };
             }
 
-            return { ok: res.ok, status: res.status, body: parsed };
-          }, 10000);
+            return { ok: res.ok, status: res.status, body: parsed, sentAuth: !!token };
+          }, 8000, "push status fetch timeout");
 
           result.pushStatus = statusJson;
         } catch (e: any) {
-          // If this was aborted due to timeout OR unmount, show it but don't fail the whole debug page.
           if (e?.name === "AbortError") {
             result.pushStatus = { ok: false, aborted: true, message: e?.message ?? "AbortError" };
           } else {
@@ -143,7 +181,6 @@ export default function DebugPage() {
           }
         }
       } catch (e: any) {
-        // Only truly unexpected errors land here
         result.error = e?.message ?? String(e);
       }
 
@@ -152,17 +189,24 @@ export default function DebugPage() {
     })();
 
     return () => {
-      // This prevents state update + avoids treating cleanup aborts as “real failures”
       isAlive = false;
     };
   }, []);
 
   return (
     <div className="p-4 max-w-3xl mx-auto space-y-3">
-      <h1 className="text-xl font-semibold">Debug</h1>
-      <pre className="text-xs overflow-auto border rounded p-4">
-        {JSON.stringify(out, null, 2)}
-      </pre>
+      <div className="flex items-center justify-between">
+        <h1 className="text-xl font-semibold">Debug</h1>
+
+        <Link
+          href="/settings"
+          className="inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 text-sm hover:bg-muted"
+        >
+          ← Back to Settings
+        </Link>
+      </div>
+
+      <pre className="text-xs overflow-auto border rounded p-4">{JSON.stringify(out, null, 2)}</pre>
     </div>
   );
 }
