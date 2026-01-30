@@ -1,3 +1,4 @@
+// src/lib/ensureUserSettings.ts
 import { supabase } from "@/lib/supabaseClient";
 
 function guessTz() {
@@ -9,19 +10,27 @@ function guessTz() {
 }
 
 export async function ensureUserSettings() {
-  const { data, error } = await supabase.auth.getUser();
-  if (error) return;
-  const uid = data.user?.id;
-  if (!uid) return;
+  try {
+    // Prefer session on client (fast, local). Avoids extra auth fetches during SW weirdness.
+    const { data: sessionData } = await supabase.auth.getSession();
+    const uid = sessionData.session?.user?.id;
+    if (!uid) return;
 
-  const tz = guessTz();
+    const tz = guessTz();
 
-  // upsert defaults (will not overwrite existing user customizations later)
-  await supabase
-    .schema("disciplined")
-    .from("user_settings")
-    .upsert(
-      { user_id: uid, timezone: tz, updated_at: new Date().toISOString() },
-      { onConflict: "user_id" }
-    );
+    const { error } = await supabase
+      .schema("disciplined")
+      .from("user_settings")
+      .upsert(
+        { user_id: uid, timezone: tz, updated_at: new Date().toISOString() },
+        { onConflict: "user_id" }
+      );
+
+    // Don’t throw — this should never brick the UI.
+    if (error) {
+      console.warn("ensureUserSettings upsert failed:", error.message);
+    }
+  } catch (e: any) {
+    console.warn("ensureUserSettings failed:", e?.message ?? e);
+  }
 }

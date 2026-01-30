@@ -1,13 +1,12 @@
 // public/sw.js
 
-self.addEventListener("install", (event) => {
-  // Activate this SW as soon as it's finished installing
-  self.skipWaiting();
+self.addEventListener("install", () => {
+  // Do NOT skipWaiting on iOS PWAs; it can create mixed-version app state.
+  // The new SW will activate after old tabs close naturally.
 });
 
-self.addEventListener("activate", (event) => {
-  // Take control of all open clients immediately
-  event.waitUntil(self.clients.claim());
+self.addEventListener("activate", () => {
+  // Do NOT clients.claim() on iOS PWAs; same reason (mixed versions).
 });
 
 self.addEventListener("push", (event) => {
@@ -31,23 +30,19 @@ self.addEventListener("push", (event) => {
 
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
-
   const url = (event.notification.data && event.notification.data.url) || "/today";
 
   event.waitUntil(
     (async () => {
       const allClients = await clients.matchAll({ type: "window", includeUncontrolled: true });
-
-      // Prefer focusing an existing tab/window if possible
       for (const client of allClients) {
         if (client.url.includes(url) && "focus" in client) return client.focus();
       }
-
       if (clients.openWindow) return clients.openWindow(url);
     })()
   );
 });
 
-self.addEventListener("pushsubscriptionchange", (event) => {
+self.addEventListener("pushsubscriptionchange", () => {
   // We'll re-subscribe from the client on next app open.
 });
