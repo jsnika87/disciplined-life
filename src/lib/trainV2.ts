@@ -31,6 +31,12 @@ export type TrainBodyMetrics = {
   updated_at: string;
 };
 
+/**
+ * Back-compat alias (older code used BodyMetrics)
+ * Keep this until we’ve migrated all imports.
+ */
+export type BodyMetrics = TrainBodyMetrics;
+
 export type TrainExercise = {
   id: string;
   session_id: string;
