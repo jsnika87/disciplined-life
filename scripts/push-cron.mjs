@@ -23,6 +23,10 @@ function toSubscriptionRow(row) {
   return { endpoint: row.endpoint, keys: { p256dh: row.p256dh, auth: row.auth } };
 }
 
+function mod1440(n) {
+  return ((n % 1440) + 1440) % 1440;
+}
+
 async function alreadySent(userId, kind, localDate) {
   const { data, error } = await admin
     .schema("disciplined")
@@ -124,40 +128,72 @@ async function main() {
     const localDate = now.toISODate();
     const localMin = now.hour * 60 + now.minute;
 
-    // (1) Fasting/Eating window transitions
+    // (1) Fasting/Eating window transitions + 30-min warning
     if (u.push_fasting_windows) {
-      if (localMin === u.eating_start_min) {
-        const kind = "window_start";
-        if (!(await alreadySent(u.user_id, kind, localDate))) {
-          const res = await sendPush(u.user_id, {
-            title: "Eating window is open",
-            body: "You’re in your eating window now.",
-            data: { url: "/today" },
-          });
-          if (res.ok) {
-            await markSent(u.user_id, kind, localDate, localMin);
-            sentCount++;
+      const startMin = Number(u.eating_start_min);
+      const endMin = Number(u.eating_end_min);
+
+      if (!Number.isFinite(startMin) || !Number.isFinite(endMin)) {
+        // if settings are missing/invalid, skip safely
+      } else {
+        // If endMin < startMin, the eating window crosses midnight.
+        // For notifications happening after midnight (localMin < endMin),
+        // log against "yesterday" to avoid double-send in the new date.
+        const windowKeyDate =
+          endMin < startMin && localMin < endMin ? now.minus({ days: 1 }).toISODate() : localDate;
+
+        // A) Eating window opened
+        if (localMin === startMin) {
+          const kind = "window_start";
+          if (!(await alreadySent(u.user_id, kind, windowKeyDate))) {
+            const res = await sendPush(u.user_id, {
+              title: "Eating window is open",
+              body: "You’re in your eating window now.",
+              data: { url: "/today" },
+            });
+            if (res.ok) {
+              await markSent(u.user_id, kind, windowKeyDate, localMin);
+              sentCount++;
+            }
           }
         }
-      }
 
-      if (localMin === u.eating_end_min) {
-        const kind = "window_end";
-        if (!(await alreadySent(u.user_id, kind, localDate))) {
-          const res = await sendPush(u.user_id, {
-            title: "Fasting window started",
-            body: "Eating window closed. You’re fasting now.",
-            data: { url: "/today" },
-          });
-          if (res.ok) {
-            await markSent(u.user_id, kind, localDate, localMin);
-            sentCount++;
+        // B) Eating window ends soon (30 min before end)
+        const warnMin = mod1440(endMin - 30);
+        if (localMin === warnMin) {
+          const kind = "window_ending_soon";
+          if (!(await alreadySent(u.user_id, kind, windowKeyDate))) {
+            const res = await sendPush(u.user_id, {
+              title: "Eating window ends soon",
+              body: "30 minutes left in your eating window.",
+              data: { url: "/today" },
+            });
+            if (res.ok) {
+              await markSent(u.user_id, kind, windowKeyDate, localMin);
+              sentCount++;
+            }
+          }
+        }
+
+        // C) Fasting window started (eating window ended)
+        if (localMin === endMin) {
+          const kind = "window_end";
+          if (!(await alreadySent(u.user_id, kind, windowKeyDate))) {
+            const res = await sendPush(u.user_id, {
+              title: "Fasting window started",
+              body: "Eating window closed. You’re fasting now.",
+              data: { url: "/today" },
+            });
+            if (res.ok) {
+              await markSent(u.user_id, kind, windowKeyDate, localMin);
+              sentCount++;
+            }
           }
         }
       }
     }
 
-    // (2) 8pm local reminder if incomplete
+    // (2) Daily reminder if incomplete
     if (u.push_daily_reminder) {
       if (localMin === u.daily_reminder_time_min) {
         const kind = "daily_reminder";
