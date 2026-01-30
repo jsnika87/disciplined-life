@@ -38,18 +38,17 @@ function loadEnvFile(filePath) {
       }
     }
   } catch (e) {
-    // Don't crash cron due to env parsing
     console.warn(`[push-cron] env load failed for ${filePath}:`, e?.message ?? String(e));
   }
 }
 
 function ensureEnvLoaded() {
-  // Prefer project root near this file
+  // Project root near this file
   const projectRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
   loadEnvFile(path.join(projectRoot, ".env.local"));
   loadEnvFile(path.join(projectRoot, ".env"));
 
-  // Also try cwd if someone runs from elsewhere
+  // Also try cwd if run from elsewhere
   loadEnvFile(path.join(process.cwd(), ".env.local"));
   loadEnvFile(path.join(process.cwd(), ".env"));
 }
@@ -64,20 +63,44 @@ function need(name) {
 
 const SUPABASE_URL = need("NEXT_PUBLIC_SUPABASE_URL");
 const SERVICE_KEY = need("SUPABASE_SERVICE_ROLE_KEY");
-
 const VAPID_PUBLIC = need("NEXT_PUBLIC_VAPID_PUBLIC_KEY");
 const VAPID_PRIVATE = need("VAPID_PRIVATE_KEY");
 
-const VAPID_SUBJECT = process.env.VAPID_SUBJECT || "mailto:admin@disciplined.life";
+webpush.setVapidDetails("mailto:admin@disciplined.life", VAPID_PUBLIC, VAPID_PRIVATE);
 
-webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC, VAPID_PRIVATE);
-
-const admin = createClient(SUPABASE_URL, SERVICE_KEY, {
-  auth: { persistSession: false },
-});
+const admin = createClient(SUPABASE_URL, SERVICE_KEY, { auth: { persistSession: false } });
 
 function toSubscriptionRow(row) {
   return { endpoint: row.endpoint, keys: { p256dh: row.p256dh, auth: row.auth } };
+}
+
+function mod1440(n) {
+  return ((n % 1440) + 1440) % 1440;
+}
+
+/**
+ * Return true if target minute is inside the last WINDOW minutes (inclusive),
+ * supporting wrap-around at midnight.
+ *
+ * Example WINDOW=5:
+ *   if nowMin=675 (11:15), window = 671..675
+ */
+function inLastNMinutesWindow(targetMin, nowMin, WINDOW = 5) {
+  const end = mod1440(nowMin);
+  const start = mod1440(nowMin - (WINDOW - 1));
+  const t = mod1440(targetMin);
+
+  // Non-wrapping window
+  if (start <= end) return t >= start && t <= end;
+
+  // Wrapping window (e.g., 23:58..00:02)
+  return t >= start || t <= end;
+}
+
+function kindKey(baseKind, targetMin) {
+  // This is the core fix: make the "kind" unique per target minute.
+  // That way, if you change the eating window later the same day, the new time can still send once.
+  return `${baseKind}@${mod1440(targetMin)}`;
 }
 
 async function alreadySent(userId, kind, localDate) {
@@ -100,7 +123,7 @@ async function markSent(userId, kind, localDate, localMin) {
     .from("push_send_log")
     .insert({ user_id: userId, kind, local_date: localDate, local_min: localMin });
 
-  // allow idempotency if you added a unique constraint
+  // If you have a unique constraint, duplicates may be expected on retries
   if (error && !String(error.message).toLowerCase().includes("duplicate")) throw error;
 }
 
@@ -128,6 +151,11 @@ async function fetchUserSubscription(userId) {
   return data?.[0] ?? null;
 }
 
+async function deleteUserSubscriptions(userId) {
+  // If Apple endpoint expires, we can clean up so user can re-enable and get a fresh subscription.
+  await admin.schema("disciplined").from("push_subscriptions").delete().eq("user_id", userId);
+}
+
 async function sendPush(userId, payload) {
   const subRow = await fetchUserSubscription(userId);
   if (!subRow) return { ok: false, reason: "no_subscription" };
@@ -136,20 +164,13 @@ async function sendPush(userId, payload) {
     await webpush.sendNotification(toSubscriptionRow(subRow), JSON.stringify(payload));
     return { ok: true };
   } catch (e) {
-    return { ok: false, reason: "send_failed", message: e?.message ?? String(e) };
+    const msg = e?.message ?? String(e);
+    // If the subscription is gone/expired, clear it so next app open can re-subscribe.
+    if (String(msg).includes("410") || String(msg).includes("404")) {
+      await deleteUserSubscriptions(userId);
+    }
+    return { ok: false, reason: "send_failed", message: msg };
   }
-}
-
-/**
- * If cron runs every 5 minutes, exact-minute equality checks will miss events.
- * This returns true if we're within the last N minutes (including exact minute).
- */
-function isWithinLastMinutes(nowMin, targetMin, windowSize) {
-  if (typeof targetMin !== "number" || !Number.isFinite(targetMin)) return false;
-  const DAY = 1440;
-  // diff in [0..1439] where diff=0 means exact match, diff=1 means 1 min after, etc.
-  const diff = (nowMin - targetMin + DAY) % DAY;
-  return diff >= 0 && diff < windowSize;
 }
 
 async function areAllPillarsCompletedToday(userId, localDateISO, tz) {
@@ -185,8 +206,7 @@ async function main() {
   const users = await fetchUserSettings();
   let sentCount = 0;
 
-  // Must match your cron: */5
-  const CRON_WINDOW_MINUTES = 5;
+  const WINDOW_MINUTES = 5; // matches your */5 cron schedule
 
   for (const u of users) {
     if (!u.push_enabled) continue;
@@ -195,36 +215,44 @@ async function main() {
     const now = DateTime.now().setZone(tz);
 
     const localDate = now.toISODate();
-    const localMinNow = now.hour * 60 + now.minute;
+    const localMin = now.hour * 60 + now.minute;
 
     // (1) Fasting/Eating window transitions
     if (u.push_fasting_windows) {
-      if (isWithinLastMinutes(localMinNow, u.eating_start_min, CRON_WINDOW_MINUTES)) {
-        const kind = "window_start";
+      const startMin = mod1440(u.eating_start_min);
+      const endMin = mod1440(u.eating_end_min);
+
+      // START window
+      if (inLastNMinutesWindow(startMin, localMin, WINDOW_MINUTES)) {
+        const kind = kindKey("window_start", startMin);
+
         if (!(await alreadySent(u.user_id, kind, localDate))) {
           const res = await sendPush(u.user_id, {
             title: "Eating window is open",
             body: "You’re in your eating window now.",
             data: { url: "/today" },
           });
+
           if (res.ok) {
-            // store the intended minute, not “now”
-            await markSent(u.user_id, kind, localDate, u.eating_start_min);
+            await markSent(u.user_id, kind, localDate, localMin);
             sentCount++;
           }
         }
       }
 
-      if (isWithinLastMinutes(localMinNow, u.eating_end_min, CRON_WINDOW_MINUTES)) {
-        const kind = "window_end";
+      // END window
+      if (inLastNMinutesWindow(endMin, localMin, WINDOW_MINUTES)) {
+        const kind = kindKey("window_end", endMin);
+
         if (!(await alreadySent(u.user_id, kind, localDate))) {
           const res = await sendPush(u.user_id, {
             title: "Fasting window started",
             body: "Eating window closed. You’re fasting now.",
             data: { url: "/today" },
           });
+
           if (res.ok) {
-            await markSent(u.user_id, kind, localDate, u.eating_end_min);
+            await markSent(u.user_id, kind, localDate, localMin);
             sentCount++;
           }
         }
@@ -233,8 +261,10 @@ async function main() {
 
     // (2) Daily reminder if incomplete
     if (u.push_daily_reminder) {
-      if (isWithinLastMinutes(localMinNow, u.daily_reminder_time_min, CRON_WINDOW_MINUTES)) {
-        const kind = "daily_reminder";
+      const remindMin = mod1440(u.daily_reminder_time_min);
+      if (inLastNMinutesWindow(remindMin, localMin, WINDOW_MINUTES)) {
+        const kind = kindKey("daily_reminder", remindMin);
+
         if (!(await alreadySent(u.user_id, kind, localDate))) {
           const allDone = await areAllPillarsCompletedToday(u.user_id, localDate, tz);
           if (!allDone) {
@@ -244,12 +274,12 @@ async function main() {
               data: { url: "/today" },
             });
             if (res.ok) {
-              await markSent(u.user_id, kind, localDate, u.daily_reminder_time_min);
+              await markSent(u.user_id, kind, localDate, localMin);
               sentCount++;
             }
           } else {
             // mark so we don't re-check on retries
-            await markSent(u.user_id, kind, localDate, u.daily_reminder_time_min);
+            await markSent(u.user_id, kind, localDate, localMin);
           }
         }
       }
